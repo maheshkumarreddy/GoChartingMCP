@@ -1,0 +1,26 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Chrome profile (contains user credentials, local cache)
+bot_chrome_profile/
+
+# Screenshots and test output images
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# macOS
+.DS_Store
+
+# Temporary files
+/tmp/
+*.tmp
