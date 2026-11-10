@@ -120,10 +120,22 @@ FOOTPRINT_EXTRACTION_JS = """
             });
         }
 
-        const symbol = c.security ? c.security.ticker : "NSE:NIFTY-I";
+        const store = c0?.store?.getState();
+        const sec = store?.security || c?.security || {};
+        const rawSym = sec.symbol ? (sec.exchange ? sec.exchange + ":" + sec.symbol : sec.symbol) : (document.title.includes("@") ? document.title.split("@")[1].trim() : "NSE:NIFTY-I");
+        let cleanSymbol = rawSym;
+        if (sec.segment === "OPTIONS" || sec.option_type) {
+            const oType = sec.option_type === "PUT" ? "PE" : (sec.option_type === "CALL" ? "CE" : sec.option_type);
+            cleanSymbol = `NIFTY ${sec.strike_price || ""} ${oType}`.trim();
+        } else if (sec.segment === "FUTURE" || rawSym.includes("-I")) {
+            cleanSymbol = rawSym.includes("BANK") ? "BANKNIFTY_FUT" : "NIFTY_FUT";
+        }
+
         return JSON.stringify({
             status: "ok",
-            symbol: symbol,
+            symbol: cleanSymbol,
+            raw_symbol: rawSym,
+            contract_name: sec.name || cleanSymbol,
             session_date: latestDate,
             candlesCount: results.length,
             candles: results

@@ -44,12 +44,18 @@ async def run_tests():
     print("\n[Test 2] Extracting full-day footprint clusters from GoCharting...")
     data = None
     try:
-        data = await controller.extract_live_footprint_from_chart()
-        if data and data.get("status") == "ok" and data.get("candlesCount", 0) > 0:
+        series_list = await controller.extract_live_footprint_from_all_tabs()
+        if series_list and len(series_list) > 0:
+            for s in series_list:
+                store.sync_from_browser_series(s)
+            
+            # Find NIFTY_FUT data
+            data = next((s for s in series_list if "FUT" in s.get("symbol", "")), series_list[0])
             count = data.get("candlesCount")
             first_c = data["candles"][0]
             last_c = data["candles"][-1]
-            print(f"   ✅ PASS: Successfully extracted {count} 1-minute footprint candles!")
+            print(f"   ✅ PASS: Successfully extracted {len(series_list)} chart(s) with {count} 1-minute footprint candles!")
+            print(f"            Active Symbols: {[s.get('symbol') for s in series_list]}")
             print(f"            Session Date: {data.get('session_date')}")
             print(f"            First bar: {first_c.get('date_str')} | Last bar: {last_c.get('date_str')}")
             if count >= 300:
@@ -59,7 +65,7 @@ async def run_tests():
                 print(f"   ⚠️ WARNING: Received only {count} candles (< 300 expected for full day)")
                 passed += 1
         else:
-            print(f"   ❌ FAIL: Extraction failed: {data}")
+            print(f"   ❌ FAIL: Extraction failed: {series_list}")
     except Exception as e:
         print(f"   ❌ FAIL: {e}")
 
@@ -69,9 +75,9 @@ async def run_tests():
     total += 1
     print("\n[Test 3] Testing Deterministic CVD (Zero Accumulator Drift)...")
     try:
-        if data and data.get("status") == "ok":
-            store.sync_from_browser_series(data)
-            cvd_run_1 = store.get_latest_candle("NIFTY_FUT").cvd
+        latest = store.get_latest_candle("NIFTY_FUT")
+        if latest and data:
+            cvd_run_1 = latest.cvd
 
             # Run 10 consecutive syncs
             for _ in range(10):
@@ -84,7 +90,7 @@ async def run_tests():
             else:
                 print(f"   ❌ FAIL: CVD drifted! Initial: {cvd_run_1}, After 10 syncs: {cvd_run_11}")
         else:
-            print("   ⚠️ SKIP: Skipping CVD test because extraction failed.")
+            print("   ⚠️ SKIP: Skipping CVD test because NIFTY_FUT candle not found.")
     except Exception as e:
         print(f"   ❌ FAIL: {e}")
 
