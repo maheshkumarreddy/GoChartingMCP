@@ -1,7 +1,8 @@
 """
 Order Flow State Store for GoCharting 1-Minute Footprint Data.
 Handles dynamic tick calculations, level-by-level delta profiles,
-deterministic CVD accumulation, POC detection, and institutional positioning quadrants.
+deterministic CVD accumulation, POC detection, session date transitions,
+and institutional positioning quadrants (both individual candle and window aggregate).
 """
 
 from typing import Dict, List, Optional, Any
@@ -127,8 +128,8 @@ def classify_positioning_quadrant(price_change: float, net_delta: int, oi_change
     - LONG_UNWINDING_DIV: Price <= 0, Delta > 0, OI < 0 (Passive long unwinding under buy pressure)
 
     Neutral States:
-    - NEUTRAL_OI: OI Change is 0 (No contracts added or closed)
     - NEUTRAL: Price flat, Delta 0, OI 0
+    - NEUTRAL_OI: OI Change is 0 (No contracts added or closed)
     """
     if price_change == 0 and net_delta == 0 and oi_change == 0:
         return "NEUTRAL"
@@ -150,12 +151,28 @@ def classify_positioning_quadrant(price_change: float, net_delta: int, oi_change
             return "ABSORPTION_SELL" if oi_change > 0 else "LONG_UNWINDING_DIV"
         else:
             return "SHORT_BUILDUP" if oi_change > 0 else "LONG_UNWINDING"
-    else:  # Flat price
+    else:  # Flat price (price_change == 0)
         if net_delta > 0:
             return "LONG_BUILDUP" if oi_change > 0 else "SHORT_COVERING"
         elif net_delta < 0:
             return "SHORT_BUILDUP" if oi_change > 0 else "LONG_UNWINDING"
         return "NEUTRAL"
+
+
+def get_quadrant_explanation(quadrant: str) -> str:
+    """Returns canonical institutional meaning for any positioning quadrant."""
+    return {
+        "LONG_BUILDUP": "Aggressive fresh buyers entering new long positions (Institutional Bullish continuation).",
+        "SHORT_COVERING": "Short sellers forced to buy back/liquidate (Short squeeze / exhaustion rally).",
+        "SHORT_BUILDUP": "Aggressive institutional sellers initiating fresh short positions (Institutional Bearish continuation).",
+        "LONG_UNWINDING": "Long holders liquidating/stop-losses triggering (Long liquidation cascade).",
+        "ABSORPTION_BUY": "Passive institutional buyers absorbing aggressive market sell orders (Potential bullish bottoming).",
+        "ABSORPTION_SELL": "Passive institutional sellers absorbing aggressive market buy orders (Potential bearish topping).",
+        "SHORT_COVERING_DIV": "Passive short covering absorbing market selling.",
+        "LONG_UNWINDING_DIV": "Passive long liquidation into market buying.",
+        "NEUTRAL_OI": "Zero net change in open interest contracts across these candles.",
+        "NEUTRAL": "Completely flat order flow and price action."
+    }.get(quadrant, "Mixed positioning.")
 
 
 class MultiChartOrderFlowStore:
@@ -167,6 +184,8 @@ class MultiChartOrderFlowStore:
         self.symbol_meta: Dict[str, Dict[str, Any]] = {}
         # symbol -> running CVD (final cumulative session delta)
         self.running_cvd: Dict[str, int] = {}
+        # Active session date per symbol (e.g. '2026-11-09') to handle new day transitions cleanly
+        self.active_session_date: Dict[str, str] = {}
         # Pending UI command for browser bridge
         self.pending_command: Optional[Dict[str, Any]] = None
 
@@ -182,8 +201,11 @@ class MultiChartOrderFlowStore:
     def sync_from_browser_series(self, payload: Dict[str, Any]):
         """
         Syncs live footprint data extracted directly from GoCharting.
-        CRITICAL FIX: CVD is computed deterministically starting from the first candle of the session,
-        preventing accumulator drift across repeated sync cycles.
+        Guarantees:
+        - Daily Session Reset: If a new trading day begins, cache and CVD reset cleanly from 09:15.
+        - Deterministic CVD: Computed from session origin (0) with zero accumulator drift.
+        - Strict 3-condition positioning quadrant per candle.
+        - Dual divergence reporting: both close_to_close_divergence and intra_candle_divergence.
         """
         raw_symbol = payload.get("symbol", "NSE:NIFTY-I")
         symbol = "NIFTY_FUT" if "NIFTY" in raw_symbol else ("BANKNIFTY_FUT" if "BANKNIFTY" in raw_symbol else raw_symbol)
@@ -192,12 +214,21 @@ class MultiChartOrderFlowStore:
         if not raw_candles:
             return
 
+        session_date = payload.get("session_date")
+        if session_date:
+            prior_date = self.active_session_date.get(symbol)
+            if prior_date and prior_date != session_date:
+                # Clean session boundary transition: reset cache and CVD for new trading day
+                print(f"[Store Session Reset] New session date '{session_date}' detected (was '{prior_date}'). Resetting {symbol} cache and CVD.")
+                self.candles[symbol] = []
+                self.running_cvd[symbol] = 0
+            self.active_session_date[symbol] = session_date
+
         self.update_metadata(symbol, tick_size=0.05, display_tick_size=1.0, precision=2)
 
-        # Sort incoming candles chronologically ascending (oldest first) to ensure deterministic CVD
+        # Sort incoming candles chronologically ascending (oldest first)
         def parse_ts(c_item):
-            t_str = c_item.get("timestamp") or c_item.get("date_str", "")
-            return t_str
+            return c_item.get("timestamp") or c_item.get("date_str", "")
 
         sorted_raw = sorted(raw_candles, key=parse_ts)
 
@@ -263,10 +294,16 @@ class MultiChartOrderFlowStore:
             running_cvd_accumulator += net_delta
             current_candle_cvd = running_cvd_accumulator
 
+            # Dual divergence checks: close-to-close vs intra-candle
+            c2c_divergence = (price_change > 0 and net_delta < 0) or (price_change < 0 and net_delta > 0)
+            intra_divergence = (close_p > open_p and net_delta < 0) or (close_p < open_p and net_delta > 0)
+
             signals = {
                 "stacked_buy_imbalance": [lvl.price for lvl in tick_levels if lvl.is_buy_imbalance],
                 "stacked_sell_imbalance": [lvl.price for lvl in tick_levels if lvl.is_sell_imbalance],
-                "delta_divergence": (close_p > open_p and net_delta < 0) or (close_p < open_p and net_delta > 0),
+                "delta_divergence": c2c_divergence,  # Standard close-to-close benchmark
+                "close_to_close_divergence": c2c_divergence,
+                "intra_candle_divergence": intra_divergence,
                 "absorption_at_low": (net_delta < 0 and close_p > low_p + (high_p - low_p) * 0.4),
                 "absorption_at_high": (net_delta > 0 and close_p < high_p - (high_p - low_p) * 0.4)
             }
@@ -323,17 +360,21 @@ class MultiChartOrderFlowStore:
         chart = self.candles.get(symbol, [])
         return chart[0] if chart else None
 
-    def get_history(self, symbol: str, limit: int = 10) -> List[CandleOrderFlow]:
+    def get_history(self, symbol: str, limit: int = 10, exclude_post_close: bool = False) -> List[CandleOrderFlow]:
         if limit <= 0:
             return []
-        return self.candles.get(symbol, [])[:limit]
+        chart = self.candles.get(symbol, [])
+        if exclude_post_close:
+            chart = [c for c in chart if not c.is_post_close]
+        return chart[:limit]
 
-    def get_oi_analysis(self, symbol: str, lookback: int = 10) -> Dict[str, Any]:
+    def get_oi_analysis(self, symbol: str, lookback: int = 10, exclude_post_close: bool = False) -> Dict[str, Any]:
         """
         Analyzes Open Interest changes alongside Net Delta to categorize
-        institutional order flow into canonical positioning quadrants:
-        - LONG_BUILDUP, SHORT_COVERING, SHORT_BUILDUP, LONG_UNWINDING,
-        - ABSORPTION_BUY, ABSORPTION_SELL, SHORT_COVERING_DIV, LONG_UNWINDING_DIV, NEUTRAL_OI.
+        institutional order flow into canonical positioning quadrants.
+        Provides BOTH:
+        1. Window Aggregate Positioning (calculated over the net delta, net price change, and net OI change of the entire lookback)
+        2. Modal Candle Quadrant (the plurality quadrant across individual candles)
         """
         if lookback <= 0:
             return {
@@ -342,6 +383,9 @@ class MultiChartOrderFlowStore:
             }
 
         all_candles = self.candles.get(symbol, [])
+        if exclude_post_close:
+            all_candles = [c for c in all_candles if not c.is_post_close]
+
         if not all_candles:
             return {"error": f"No candles available for {symbol}."}
 
@@ -363,16 +407,21 @@ class MultiChartOrderFlowStore:
         }
         total_delta = 0
         total_oi_change = 0
+        post_close_count = 0
 
         for c in reversed(candles):
             total_delta += c.net_delta
             total_oi_change += c.oi_change
+            if c.is_post_close:
+                post_close_count += 1
             q = c.positioning_quadrant
             quadrant_counts[q] = quadrant_counts.get(q, 0) + 1
 
             timeline.append({
                 "timestamp": c.timestamp,
+                "open": c.open_price,
                 "close": c.close_price,
+                "prev_close": c.prev_close_price,
                 "price_change": c.price_change,
                 "delta": c.net_delta,
                 "min_delta": c.min_delta,
@@ -386,27 +435,20 @@ class MultiChartOrderFlowStore:
 
         latest = candles[0]
         first = candles[-1]
-        price_change = round(latest.close_price - first.prev_close_price, 2)
+        price_change_window = round(latest.close_price - first.prev_close_price, 2)
 
-        # Primary positioning theme
-        dominant_quadrant = max(
+        # 1. Window Aggregate Positioning (Institutional flow over the full window)
+        window_quadrant = classify_positioning_quadrant(price_change_window, total_delta, total_oi_change)
+        window_explanation = get_quadrant_explanation(window_quadrant)
+
+        # 2. Modal Individual Candle Quadrant (plurality)
+        modal_quadrant = max(
             quadrant_counts.keys(),
             key=lambda k: quadrant_counts.get(k, 0)
         )
-        dominant_count = quadrant_counts.get(dominant_quadrant, 0)
-        dominant_pct = round((dominant_count / len(candles)) * 100, 1)
-
-        summary_explanation = {
-            "LONG_BUILDUP": "Aggressive fresh buyers entering new long positions (Institutional Bullish continuation).",
-            "SHORT_COVERING": "Short sellers forced to buy back/liquidate (Short squeeze / exhaustion rally).",
-            "SHORT_BUILDUP": "Aggressive institutional sellers initiating fresh short positions (Institutional Bearish continuation).",
-            "LONG_UNWINDING": "Long holders liquidating/stop-losses triggering (Long liquidation cascade).",
-            "ABSORPTION_BUY": "Passive institutional buyers absorbing aggressive market sell orders (Potential bullish bottoming).",
-            "ABSORPTION_SELL": "Passive institutional sellers absorbing aggressive market buy orders (Potential bearish topping).",
-            "SHORT_COVERING_DIV": "Passive short covering absorbing market selling.",
-            "LONG_UNWINDING_DIV": "Passive long liquidation into market buying.",
-            "NEUTRAL_OI": "Zero change in open interest contracts across these candles."
-        }.get(dominant_quadrant, "Mixed positioning.")
+        modal_count = quadrant_counts.get(modal_quadrant, 0)
+        modal_pct = round((modal_count / len(candles)) * 100, 1)
+        modal_explanation = get_quadrant_explanation(modal_quadrant)
 
         session_info = get_market_session_info(latest.timestamp)
 
@@ -415,12 +457,21 @@ class MultiChartOrderFlowStore:
             "requested_lookback": lookback,
             "actual_lookback": len(candles),
             "is_clamped": is_clamped,
+            "exclude_post_close": exclude_post_close,
+            "post_close_candles_in_window": post_close_count,
             "latest_oi": latest.open_interest,
             "net_oi_change_lookback": total_oi_change,
             "net_delta_lookback": total_delta,
-            "price_change_lookback": price_change,
-            "dominant_positioning": f"{dominant_quadrant} ({dominant_pct}% of candles)",
-            "interpretation": summary_explanation,
+            "price_change_lookback": price_change_window,
+            # Window Aggregate Output (Resolves §4B)
+            "window_aggregate_positioning": window_quadrant,
+            "window_interpretation": f"Window Aggregate ({len(candles)} candles): {window_explanation}",
+            # Modal Candle Output (Detailed Breakdown)
+            "modal_candle_quadrant": f"{modal_quadrant} ({modal_pct}% of candles)",
+            "modal_quadrant_interpretation": modal_explanation,
+            # Backward-compatible alias
+            "dominant_positioning": f"{modal_quadrant} ({modal_pct}% of candles)",
+            "interpretation": f"Window aggregate is {window_quadrant} (net delta: {total_delta:+d}, price: {price_change_window:+.1f}, OI: {total_oi_change:+d}). Modal individual bar: {modal_quadrant} ({modal_pct}%).",
             "quadrant_distribution": {k: v for k, v in quadrant_counts.items() if v > 0},
             "market_session_state": session_info["market_session_state"],
             "is_live": session_info["is_live"],
@@ -437,6 +488,7 @@ class MultiChartOrderFlowStore:
                 session_info = get_market_session_info(latest.timestamp)
                 result.append({
                     "symbol": sym,
+                    "session_date": self.active_session_date.get(sym),
                     "candles_count": len(candles),
                     "latest_time": latest.timestamp,
                     "latest_close": latest.close_price,

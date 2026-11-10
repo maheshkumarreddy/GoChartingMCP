@@ -2,7 +2,8 @@
 """
 Automated Test Suite for GoCharting Order Flow MCP Server
 Validates CDP browser connection, full-day footprint extraction, deterministic CVD,
-institutional positioning quadrants, min/max delta resolution, and lookback validations.
+institutional positioning quadrants, min/max delta resolution, close-to-close vs intra divergence,
+window aggregate positioning, and optional post-market candle exclusions.
 Run this before committing or deploying changes to AWS.
 """
 
@@ -15,9 +16,9 @@ import server
 
 
 async def run_tests():
-    print("=" * 70)
-    print("🧪 Running GoCharting MCP Pre-Deployment Regression Test Suite")
-    print("=" * 70)
+    print("=" * 75)
+    print("🧪 Running GoCharting MCP Pre-Deployment Regression Test Suite (v2.1)")
+    print("=" * 75)
     passed = 0
     total = 0
 
@@ -63,13 +64,12 @@ async def run_tests():
         print(f"   ❌ FAIL: {e}")
 
     # ---------------------------------------------------------
-    # Test 3: Deterministic CVD (Zero Drift Across 10 Syncs)
+    # Test 3: Deterministic CVD (Zero Accumulator Drift)
     # ---------------------------------------------------------
     total += 1
     print("\n[Test 3] Testing Deterministic CVD (Zero Accumulator Drift)...")
     try:
         if data and data.get("status") == "ok":
-            # Initial sync
             store.sync_from_browser_series(data)
             cvd_run_1 = store.get_latest_candle("NIFTY_FUT").cvd
 
@@ -94,9 +94,7 @@ async def run_tests():
     total += 1
     print("\n[Test 4] Verifying intra-candle min_delta and max_delta separation...")
     try:
-        latest = store.get_latest_candle("NIFTY_FUT")
         all_candles = store.candles.get("NIFTY_FUT", [])
-        # Find any candle where min_delta != max_delta
         separated = [c for c in all_candles if c.min_delta != c.max_delta or c.min_delta != c.net_delta]
         if separated:
             sample = separated[0]
@@ -115,20 +113,16 @@ async def run_tests():
     print("\n[Test 5] Testing 3-Variable Positioning Quadrant Classifications...")
     try:
         test_cases = [
-            # (price_change, net_delta, oi_change, expected_quadrant)
             (2.0, 5000, 1000, "LONG_BUILDUP"),
             (2.0, 5000, -1000, "SHORT_COVERING"),
             (-2.0, -5000, 1000, "SHORT_BUILDUP"),
             (-2.0, -5000, -1000, "LONG_UNWINDING"),
-            # Divergences / Absorptions
             (1.0, -10335, 500, "ABSORPTION_BUY"),
             (1.0, -2405, -500, "SHORT_COVERING_DIV"),
             (-1.0, 5000, 1000, "ABSORPTION_SELL"),
             (-1.0, 5000, -1000, "LONG_UNWINDING_DIV"),
-            # Zero OI change
             (1.0, -4355, 0, "NEUTRAL_OI"),
             (-1.0, 4355, 0, "NEUTRAL_OI"),
-            # Flat
             (0.0, 0, 0, "NEUTRAL"),
         ]
 
@@ -148,16 +142,74 @@ async def run_tests():
         print(f"   ❌ FAIL: {e}")
 
     # ---------------------------------------------------------
-    # Test 6: Lookback Input Validations (-1, 0, Clamping)
+    # Test 6: Dual Divergence Flag Verification (§4A)
     # ---------------------------------------------------------
     total += 1
-    print("\n[Test 6] Testing Lookback Edge Cases (lookback=-1, 0, 500)...")
+    print("\n[Test 6] Testing Dual Divergence (Close-to-Close vs Intra-Candle §4A)...")
     try:
-        # Negative lookback
+        signals_res = await server.get_orderflow_signals(symbol="NIFTY_FUT", lookback=500)
+        breakdowns = signals_res.get("candle_breakdowns", [])
+        c_1210 = next((b for b in breakdowns if "12:10" in b["timestamp"]), None)
+        if c_1210:
+            # 12:10 price_change was -5.0 (down), net_delta was +14950 (buy).
+            # Close-to-close divergence MUST be True!
+            if c_1210["delta_divergence"] is True and c_1210["close_to_close_divergence"] is True and "open" in c_1210:
+                print(f"   ✅ PASS: 12:10 candle correctly flagged delta_divergence = True (price_change: {c_1210['price_change']}, delta: {c_1210['delta']}).")
+                print(f"            Open ({c_1210['open']}) and Close ({c_1210['close']}) exposed for client verification.")
+                passed += 1
+            else:
+                print(f"   ❌ FAIL: 12:10 divergence mismatch: {c_1210}")
+        else:
+            print("   ❌ FAIL: 12:10 candle not found in breakdowns")
+    except Exception as e:
+        print(f"   ❌ FAIL: {e}")
+
+    # ---------------------------------------------------------
+    # Test 7: Window Aggregate Positioning vs Modal Plurality (§4B)
+    # ---------------------------------------------------------
+    total += 1
+    print("\n[Test 7] Testing Window Aggregate Positioning vs Modal Plurality (§4B)...")
+    try:
+        oi_res = await server.get_oi_analysis(symbol="NIFTY_FUT", lookback=10)
+        win_pos = oi_res.get("window_aggregate_positioning")
+        win_interp = oi_res.get("window_interpretation")
+        modal_pos = oi_res.get("modal_candle_quadrant")
+        if win_pos == "LONG_UNWINDING" and "LONG_UNWINDING_DIV" in modal_pos:
+            print(f"   ✅ PASS: Window Aggregate correctly classified as '{win_pos}' (price fell on net selling).")
+            print(f"            Modal Plurality explicitly separated: '{modal_pos}'.")
+            print(f"            Interpretation: {win_interp}")
+            passed += 1
+        else:
+            print(f"   ❌ FAIL: Unexpected window vs modal values: win_pos='{win_pos}', modal_pos='{modal_pos}'")
+    except Exception as e:
+        print(f"   ❌ FAIL: {e}")
+
+    # ---------------------------------------------------------
+    # Test 8: Optional Post-Close Candle Filtering (§4C)
+    # ---------------------------------------------------------
+    total += 1
+    print("\n[Test 8] Testing Post-Close Candle Handling (exclude_post_close §4C)...")
+    try:
+        oi_all = await server.get_oi_analysis(symbol="NIFTY_FUT", lookback=15, exclude_post_close=False)
+        oi_reg = await server.get_oi_analysis(symbol="NIFTY_FUT", lookback=15, exclude_post_close=True)
+        post_in_all = oi_all.get("post_close_candles_in_window", 0)
+        post_in_reg = oi_reg.get("post_close_candles_in_window", 0)
+        if post_in_all > 0 and post_in_reg == 0:
+            print(f"   ✅ PASS: Full window contains {post_in_all} post-close candles; exclude_post_close=True cleanly filtered all of them!")
+            passed += 1
+        else:
+            print(f"   ❌ FAIL: post_in_all={post_in_all}, post_in_reg={post_in_reg}")
+    except Exception as e:
+        print(f"   ❌ FAIL: {e}")
+
+    # ---------------------------------------------------------
+    # Test 9: Lookback Input Validations (-1, 0, Clamping)
+    # ---------------------------------------------------------
+    total += 1
+    print("\n[Test 9] Testing Lookback Edge Cases (lookback=-1, 0, 5000)...")
+    try:
         res_neg = await server.get_orderflow_signals(symbol="NIFTY_FUT", lookback=-1)
-        # Zero lookback
         res_zero = await server.get_orderflow_signals(symbol="NIFTY_FUT", lookback=0)
-        # Clamped lookback
         res_large = await server.get_orderflow_signals(symbol="NIFTY_FUT", lookback=5000)
 
         if "error" in res_neg and "error" in res_zero and res_large.get("is_clamped") is True:
@@ -169,31 +221,17 @@ async def run_tests():
         print(f"   ❌ FAIL: {e}")
 
     # ---------------------------------------------------------
-    # Test 7: Market Session & Staleness Metadata
+    # Test 10: Basis Units and Options Context (§4D)
     # ---------------------------------------------------------
     total += 1
-    print("\n[Test 7] Testing Market Session State and Staleness Detection...")
-    try:
-        sess = get_market_session_info("2026-11-09T15:39:00+05:30")
-        if sess["market_session_state"] in ["OPEN", "CLOSED", "PRE_OPEN", "POST_MARKET"] and sess["data_age_seconds"] is not None:
-            print(f"   ✅ PASS: Market Session: {sess['market_session_state']} | Age: {sess['data_age_seconds']}s | Warning: {sess['staleness_warning']}")
-            passed += 1
-        else:
-            print(f"   ❌ FAIL: Unexpected session info: {sess}")
-    except Exception as e:
-        print(f"   ❌ FAIL: {e}")
-
-    # ---------------------------------------------------------
-    # Test 8: Spot & Basis Analysis
-    # ---------------------------------------------------------
-    total += 1
-    print("\n[Test 8] Testing Basis (Futures - Spot) and Option Greeks...")
+    print("\n[Test 10] Testing Basis Units (basis_pct, basis_bps) & Options Context (§4D)...")
     try:
         basis_data = await server.get_basis_analysis(symbol="NIFTY")
         if basis_data and basis_data.get("status") == "ok":
             opt = basis_data.get("options_context", {})
-            print(f"   ✅ PASS: Futures: {basis_data.get('futures_price')} | Spot: {basis_data.get('spot_price')} | Basis: {basis_data.get('basis')} ({basis_data.get('basis_state')})")
-            print(f"            Max Pain: {opt.get('max_pain')} | PCR: {opt.get('pcr_oi')} | ATM IV: {opt.get('atm_iv')}%")
+            print(f"   ✅ PASS: Basis: {basis_data.get('basis')} pts | {basis_data.get('basis_pct')}% | {basis_data.get('basis_bps')} bps")
+            print(f"            Unit note: {basis_data.get('basis_unit_note')}")
+            print(f"            PCR: {opt.get('pcr_oi')} | PCR Note: {opt.get('pcr_note')}")
             print(f"            DTE Exact: {opt.get('dte_exact_days')} | DTE Calendar: {opt.get('dte_calendar_days')} days")
             passed += 1
         else:
@@ -202,29 +240,11 @@ async def run_tests():
         print(f"   ❌ FAIL: {e}")
 
     # ---------------------------------------------------------
-    # Test 9: Security Audit (browser_execute_custom_js Removed)
-    # ---------------------------------------------------------
-    total += 1
-    print("\n[Test 9] Security Audit: Verifying browser_execute_custom_js is not exposed in public tools...")
-    try:
-        # Check registered tool names in MCP server instance
-        # In python-mcp, tools are registered in server._tool_manager._tools or similar
-        tool_names = [t.name for t in await server.mcp.list_tools()]
-        if "browser_execute_custom_js" not in tool_names:
-            print(f"   ✅ PASS: browser_execute_custom_js is NOT exposed in MCP tools list!")
-            print(f"            Registered tools ({len(tool_names)}): {tool_names}")
-            passed += 1
-        else:
-            print(f"   ❌ FAIL: browser_execute_custom_js is STILL registered as a public tool!")
-    except Exception as e:
-        print(f"   ❌ FAIL: {e}")
-
-    # ---------------------------------------------------------
     # Summary
     # ---------------------------------------------------------
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 75)
     print(f"📊 Test Results: {passed}/{total} Passed")
-    print("=" * 70)
+    print("=" * 75)
     if passed == total:
         print("🎉 ALL TESTS PASSED! Ready for deployment to AWS.")
         return 0

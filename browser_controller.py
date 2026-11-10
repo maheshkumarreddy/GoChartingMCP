@@ -325,6 +325,8 @@ class GoChartingBrowserController:
                 const spotAtmStrike = spotPrice ? Math.round(spotPrice / strikeStep) * strikeStep : null;
                 const futuresAtmStrike = futuresPrice ? Math.round(futuresPrice / strikeStep) * strikeStep : null;
 
+                const basisBps = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 10000).toFixed(2)) : null;
+
                 const rawDte = firstSeries.dte;
                 const dteExactDays = rawDte !== undefined && rawDte !== null ? Number(rawDte.toFixed(1)) : null;
                 const dteCalendarDays = rawDte !== undefined && rawDte !== null ? Math.ceil(rawDte) : null;
@@ -336,8 +338,11 @@ class GoChartingBrowserController:
                     futures_price: futuresPrice,
                     spot_price: spotPrice,
                     basis: basis,
+                    basis_pct: basisPct,
                     basis_percent: basisPct,
+                    basis_bps: basisBps,
                     basis_state: basisState,
+                    basis_unit_note: 'basis is points (futures - spot). basis_pct is percentage value (-0.0665 means -0.0665%). basis_bps is basis points (-6.65 bps).',
                     strike_guidance: {
                         spot_atm_strike: spotAtmStrike,
                         futures_atm_strike: futuresAtmStrike,
@@ -348,6 +353,7 @@ class GoChartingBrowserController:
                         max_pain: firstSeries.maxPain,
                         pcr_oi: firstSeries.pcr_oi,
                         pcr_volume: firstSeries.pcr_vol,
+                        pcr_note: 'GoCharting calculates PCR from active traded strike levels in its options chain series.',
                         atm_iv: firstSeries.atmiv,
                         dte_exact_days: dteExactDays,
                         dte_calendar_days: dteCalendarDays,

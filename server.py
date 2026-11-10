@@ -21,6 +21,9 @@ from starlette.middleware.cors import CORSMiddleware
 from orderflow_store import store, get_market_session_info
 from browser_controller import controller
 
+# Admin token from environment (if set, browser-modifying actions require this token)
+MCP_ADMIN_TOKEN = os.environ.get("MCP_ADMIN_TOKEN", "").strip()
+
 # Initialize MCP Server
 mcp = MCPServer(name="GoCharting-OrderFlow-MCP")
 
@@ -33,6 +36,17 @@ async def auto_sync_if_needed():
             store.sync_from_browser_series(data)
     except Exception as e:
         print(f"[AutoSync Warning] {e}")
+
+
+def _verify_admin_access(token: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """If MCP_ADMIN_TOKEN is configured in environment, gate browser-modifying actions."""
+    if MCP_ADMIN_TOKEN:
+        if not token or token.strip() != MCP_ADMIN_TOKEN:
+            return {
+                "status": "error",
+                "message": "Unauthorized: Browser-modifying tools require a valid admin_token configured in MCP_ADMIN_TOKEN."
+            }
+    return None
 
 
 # ==========================================
@@ -61,29 +75,41 @@ async def browser_sync_now() -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def browser_change_symbol(symbol: str) -> Dict[str, Any]:
+async def browser_change_symbol(symbol: str, admin_token: Optional[str] = None) -> Dict[str, Any]:
     """
     Directly changes the chart symbol in the GoCharting browser window
     (e.g., 'NSE:NIFTY-I', 'NSE:BANKNIFTY-I', 'NIFTY 24300 CE').
+    Optionally gated by admin_token if MCP_ADMIN_TOKEN environment variable is set.
     """
+    auth_err = _verify_admin_access(admin_token)
+    if auth_err:
+        return auth_err
     return await controller.change_symbol(symbol)
 
 
 @mcp.tool()
-async def browser_change_timeframe(interval: str = "1m") -> Dict[str, Any]:
+async def browser_change_timeframe(interval: str = "1m", admin_token: Optional[str] = None) -> Dict[str, Any]:
     """
     Changes the candle interval in the GoCharting browser window
     (e.g., '1m', '3m', '5m', '15m', '30m', '1h', '1D').
+    Optionally gated by admin_token if MCP_ADMIN_TOKEN environment variable is set.
     """
+    auth_err = _verify_admin_access(admin_token)
+    if auth_err:
+        return auth_err
     return await controller.change_timeframe(interval)
 
 
 @mcp.tool()
-async def browser_open_tool(tool_name: str) -> Dict[str, Any]:
+async def browser_open_tool(tool_name: str, admin_token: Optional[str] = None) -> Dict[str, Any]:
     """
     Opens an indicator, study, or tool in the GoCharting browser window
     (e.g., 'VWAP', 'CVD', 'Profile', 'RSI').
+    Optionally gated by admin_token if MCP_ADMIN_TOKEN environment variable is set.
     """
+    auth_err = _verify_admin_access(admin_token)
+    if auth_err:
+        return auth_err
     return await controller.open_tool_or_study(tool_name)
 
 
@@ -204,11 +230,16 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
 
 
 @mcp.tool()
-async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) -> Dict[str, Any]:
+async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5, exclude_post_close: bool = False) -> Dict[str, Any]:
     """
     Analyzes order flow across the last N 1-minute candles for the symbol.
     Detects Cumulative Volume Delta (CVD) divergence, aggressive absorption,
     and stacked buy/sell imbalances.
+
+    Divergence Definitions:
+    - delta_divergence (close-to-close): True when (close - prev_close) opposes net_delta sign.
+    - intra_candle_divergence: True when (close - open) opposes net_delta sign.
+    Both are explicitly returned for full verification.
     """
     if lookback <= 0:
         return {
@@ -218,6 +249,9 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
 
     await auto_sync_if_needed()
     all_candles = store.candles.get(symbol, [])
+    if exclude_post_close:
+        all_candles = [c for c in all_candles if not c.is_post_close]
+
     if not all_candles:
         return {"error": f"No history found for {symbol}."}
 
@@ -226,22 +260,32 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
 
     recent_signals = []
     total_delta = 0
+    post_close_count = 0
 
     for c in reversed(candles):
         total_delta += c.net_delta
+        if c.is_post_close:
+            post_close_count += 1
         recent_signals.append({
             "timestamp": c.timestamp,
+            "open": c.open_price,
+            "high": c.high_price,
+            "low": c.low_price,
             "close": c.close_price,
+            "prev_close": c.prev_close_price,
             "price_change": c.price_change,
             "delta": c.net_delta,
             "min_delta": c.min_delta,
             "max_delta": c.max_delta,
             "poc": c.poc_price,
+            "delta_divergence": c.signals.get("delta_divergence", False),
+            "close_to_close_divergence": c.signals.get("close_to_close_divergence", False),
+            "intra_candle_divergence": c.signals.get("intra_candle_divergence", False),
             "absorption_low": c.signals.get("absorption_at_low", False),
             "absorption_high": c.signals.get("absorption_at_high", False),
-            "delta_divergence": c.signals.get("delta_divergence", False),
             "buy_imbalances": c.signals.get("stacked_buy_imbalance", []),
-            "sell_imbalances": c.signals.get("stacked_sell_imbalance", [])
+            "sell_imbalances": c.signals.get("stacked_sell_imbalance", []),
+            "is_post_close": c.is_post_close
         })
 
     latest = candles[0]
@@ -266,10 +310,16 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
         "requested_lookback": lookback,
         "candles_analyzed": len(candles),
         "is_clamped": is_clamped,
+        "exclude_post_close": exclude_post_close,
+        "post_close_candles_in_window": post_close_count,
         "bias": bias,
         "net_lookback_delta": total_delta,
         "lookback_price_change": price_change,
         "current_cvd": latest.cvd,
+        "divergence_definitions": {
+            "delta_divergence": "Close-to-Close vs Delta sign disagreement (standard order flow benchmark)",
+            "intra_candle_divergence": "Open-to-Close vs Delta sign disagreement (intra-minute candle benchmark)"
+        },
         "candle_breakdowns": recent_signals,
         "market_session_state": session_info["market_session_state"],
         "is_live": session_info["is_live"],
@@ -279,18 +329,13 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
 
 
 @mcp.tool()
-async def get_oi_analysis(symbol: str = "NIFTY_FUT", lookback: int = 10) -> Dict[str, Any]:
+async def get_oi_analysis(symbol: str = "NIFTY_FUT", lookback: int = 10, exclude_post_close: bool = False) -> Dict[str, Any]:
     """
     Analyzes 1-minute Open Interest (OI) changes alongside Net Delta to categorize
-    institutional positioning into canonical quadrants:
-    - LONG_BUILDUP: Price UP + OI UP + Buy Delta (Fresh aggressive buying)
-    - SHORT_COVERING: Price UP + OI DOWN + Buy Delta (Bears forced to buy/liquidate; short squeeze)
-    - SHORT_BUILDUP: Price DOWN + OI UP + Sell Delta (Fresh aggressive selling)
-    - LONG_UNWINDING: Price DOWN + OI DOWN + Sell Delta (Bulls liquidating / stop-loss cascade)
-    - ABSORPTION_BUY: Price UP + OI UP + Sell Delta (Passive buyers absorbing aggressive selling)
-    - ABSORPTION_SELL: Price DOWN + OI UP + Buy Delta (Passive sellers absorbing aggressive buying)
-    - SHORT_COVERING_DIV / LONG_UNWINDING_DIV: Passive covering/unwinding divergences
-    - NEUTRAL_OI: OI change is 0
+    institutional positioning into canonical quadrants.
+    Returns both:
+    - window_aggregate_positioning: Full lookback window aggregate flow (net delta + price change + OI change)
+    - modal_candle_quadrant: The plurality quadrant across individual bars in the window
     """
     if lookback <= 0:
         return {
@@ -299,7 +344,7 @@ async def get_oi_analysis(symbol: str = "NIFTY_FUT", lookback: int = 10) -> Dict
         }
 
     await auto_sync_if_needed()
-    return store.get_oi_analysis(symbol, lookback)
+    return store.get_oi_analysis(symbol, lookback, exclude_post_close=exclude_post_close)
 
 
 @mcp.tool()
@@ -314,11 +359,16 @@ async def get_basis_analysis(symbol: str = "NIFTY") -> Dict[str, Any]:
 
 
 @mcp.tool()
-def switch_chart(symbol: str, segment: str = "FUT", timeframe: str = "1m") -> Dict[str, Any]:
+def switch_chart(symbol: str, segment: str = "FUT", timeframe: str = "1m", admin_token: Optional[str] = None) -> Dict[str, Any]:
     """
     Requests the browser bridge to switch the active GoCharting chart to the target
     Futures contract or Option strike (e.g., 'NIFTY 24300 CE', 'BANKNIFTY 52000 PE', 'BANKNIFTY_FUT').
+    Optionally gated by admin_token if MCP_ADMIN_TOKEN environment variable is set.
     """
+    auth_err = _verify_admin_access(admin_token)
+    if auth_err:
+        return auth_err
+
     store.set_pending_switch_command(symbol=symbol, segment=segment, timeframe=timeframe)
     return {
         "status": "COMMAND_QUEUED",
@@ -378,6 +428,10 @@ async def handle_command(request: Request):
         symbol = data.get("symbol", "NIFTY_FUT")
         segment = data.get("segment", "FUT")
         timeframe = data.get("timeframe", "1m")
+        admin_token = data.get("admin_token")
+        auth_err = _verify_admin_access(admin_token)
+        if auth_err:
+            return JSONResponse(auth_err, status_code=403)
         store.set_pending_switch_command(symbol=symbol, segment=segment, timeframe=timeframe)
         return JSONResponse({"status": "ok", "queued": symbol})
     
