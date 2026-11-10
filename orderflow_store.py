@@ -2,7 +2,7 @@
 Order Flow State Store for GoCharting 1-Minute Footprint Data.
 Handles dynamic tick calculations, level-by-level delta profiles,
 deterministic CVD accumulation, POC detection, session date transitions,
-and institutional positioning quadrants (both individual candle and window aggregate).
+and simultaneous multi-chart caching (e.g. NIFTY Futures + ATM Options in parallel).
 """
 
 from typing import Dict, List, Optional, Any
@@ -53,6 +53,28 @@ class CandleOrderFlow:
     is_post_close: bool = False
     tick_deltas: List[TickDeltaLevel] = field(default_factory=list)
     signals: Dict[str, Any] = field(default_factory=dict)
+
+
+def normalize_symbol(raw_ticker: str) -> str:
+    """
+    Normalizes GoCharting security tickers into clean canonical symbols:
+    - 'NSE:NIFTY-I' -> 'NIFTY_FUT'
+    - 'NSE:BANKNIFTY-I' -> 'BANKNIFTY_FUT'
+    - 'NSE:NIFTY24N1225050CE' -> 'NIFTY24N1225050CE' (preserves options strikes)
+    - 'NIFTY 25050 CE' -> 'NIFTY 25050 CE'
+    """
+    s = raw_ticker.strip()
+    if s.startswith("NSE:"):
+        s = s[4:].strip()
+
+    if s in ["NIFTY-I", "NIFTY_FUT", "NIFTY-FUT", "NIFTY"]:
+        return "NIFTY_FUT"
+    if s in ["BANKNIFTY-I", "BANKNIFTY_FUT", "BANKNIFTY-FUT", "BANKNIFTY"]:
+        return "BANKNIFTY_FUT"
+    if s.endswith("-I"):
+        return f"{s[:-2]}_FUT"
+
+    return s
 
 
 def get_market_session_info(latest_candle_time_str: Optional[str] = None) -> Dict[str, Any]:
@@ -198,17 +220,33 @@ class MultiChartOrderFlowStore:
             "price_divisor": price_divisor
         }
 
+    def resolve_symbol(self, query: str) -> str:
+        """Finds matching active symbol by exact name, normalized name, or partial match."""
+        if query in self.candles:
+            return query
+        norm = normalize_symbol(query)
+        if norm in self.candles:
+            return norm
+
+        clean_q = query.upper().replace(" ", "").replace("_", "").replace("-", "")
+        for s in self.candles.keys():
+            clean_s = s.upper().replace(" ", "").replace("_", "").replace("-", "")
+            if clean_q == clean_s or clean_q in clean_s or clean_s in clean_q:
+                return s
+        return norm
+
     def sync_from_browser_series(self, payload: Dict[str, Any]):
         """
         Syncs live footprint data extracted directly from GoCharting.
         Guarantees:
+        - Multi-Tab Parity: Supports simultaneous caching of Futures and multiple Option strikes.
         - Daily Session Reset: If a new trading day begins, cache and CVD reset cleanly from 09:15.
         - Deterministic CVD: Computed from session origin (0) with zero accumulator drift.
         - Strict 3-condition positioning quadrant per candle.
         - Dual divergence reporting: both close_to_close_divergence and intra_candle_divergence.
         """
         raw_symbol = payload.get("symbol", "NSE:NIFTY-I")
-        symbol = "NIFTY_FUT" if "NIFTY" in raw_symbol else ("BANKNIFTY_FUT" if "BANKNIFTY" in raw_symbol else raw_symbol)
+        symbol = normalize_symbol(raw_symbol)
         
         raw_candles = payload.get("candles", [])
         if not raw_candles:
@@ -218,7 +256,6 @@ class MultiChartOrderFlowStore:
         if session_date:
             prior_date = self.active_session_date.get(symbol)
             if prior_date and prior_date != session_date:
-                # Clean session boundary transition: reset cache and CVD for new trading day
                 print(f"[Store Session Reset] New session date '{session_date}' detected (was '{prior_date}'). Resetting {symbol} cache and CVD.")
                 self.candles[symbol] = []
                 self.running_cvd[symbol] = 0
@@ -357,13 +394,15 @@ class MultiChartOrderFlowStore:
         self.candles[symbol] = processed_descending[:self.max_candles]
 
     def get_latest_candle(self, symbol: str) -> Optional[CandleOrderFlow]:
-        chart = self.candles.get(symbol, [])
+        target = self.resolve_symbol(symbol)
+        chart = self.candles.get(target, [])
         return chart[0] if chart else None
 
     def get_history(self, symbol: str, limit: int = 10, exclude_post_close: bool = False) -> List[CandleOrderFlow]:
         if limit <= 0:
             return []
-        chart = self.candles.get(symbol, [])
+        target = self.resolve_symbol(symbol)
+        chart = self.candles.get(target, [])
         if exclude_post_close:
             chart = [c for c in chart if not c.is_post_close]
         return chart[:limit]
@@ -382,7 +421,8 @@ class MultiChartOrderFlowStore:
                 "requested_lookback": lookback
             }
 
-        all_candles = self.candles.get(symbol, [])
+        target = self.resolve_symbol(symbol)
+        all_candles = self.candles.get(target, [])
         if exclude_post_close:
             all_candles = [c for c in all_candles if not c.is_post_close]
 
@@ -453,7 +493,7 @@ class MultiChartOrderFlowStore:
         session_info = get_market_session_info(latest.timestamp)
 
         return {
-            "symbol": symbol,
+            "symbol": target,
             "requested_lookback": lookback,
             "actual_lookback": len(candles),
             "is_clamped": is_clamped,
@@ -463,13 +503,10 @@ class MultiChartOrderFlowStore:
             "net_oi_change_lookback": total_oi_change,
             "net_delta_lookback": total_delta,
             "price_change_lookback": price_change_window,
-            # Window Aggregate Output (Resolves §4B)
             "window_aggregate_positioning": window_quadrant,
             "window_interpretation": f"Window Aggregate ({len(candles)} candles): {window_explanation}",
-            # Modal Candle Output (Detailed Breakdown)
             "modal_candle_quadrant": f"{modal_quadrant} ({modal_pct}% of candles)",
             "modal_quadrant_interpretation": modal_explanation,
-            # Backward-compatible alias
             "dominant_positioning": f"{modal_quadrant} ({modal_pct}% of candles)",
             "interpretation": f"Window aggregate is {window_quadrant} (net delta: {total_delta:+d}, price: {price_change_window:+.1f}, OI: {total_oi_change:+d}). Modal individual bar: {modal_quadrant} ({modal_pct}%).",
             "quadrant_distribution": {k: v for k, v in quadrant_counts.items() if v > 0},

@@ -1,70 +1,208 @@
 """
 Browser Controller for GoCharting via Chrome DevTools Protocol (CDP).
-Provides programmatic control over the dedicated Bot Chrome instance:
-- Change symbols (Nifty Futures, Bank Nifty, Options strikes)
-- Change timeframes (1m, 3m, 5m, etc.)
-- Open tools and studies (VWAP, CVD, Market Profile, OI Profile)
-- Extract 100% full-day 1-minute footprint candles directly from GoCharting's core engine
-- Extract Spot underlying, Basis, and Options chain Greek context
-- Capture live chart screenshots for visual AI inspection
+Supports simultaneous multi-tab streaming:
+- Connects to multiple GoCharting tabs concurrently (e.g. NIFTY Futures tab + ATM Option tab)
+- Programmatic control: change symbols, timeframes, open tools, and launch new chart tabs
+- Extracts full-day 1-minute footprint candles from ALL open tabs in parallel
+- Extracts Spot underlying, Basis, and Options chain Greek context
+- Captures live chart screenshots
 """
 
 import json
 import base64
 import asyncio
 import urllib.request
+from urllib.parse import quote
 import websockets
 from typing import Dict, Any, Optional, List
 
 
 CDP_PORT = 9222
 
+FOOTPRINT_EXTRACTION_JS = """
+(() => {
+    try {
+        const c0 = window.rootReduxStore?.getState()?.chartComponentList?.[0];
+        const canvasRef = c0?.store?.getState()?.transient?.chartCanvasRef?.current;
+        if (!canvasRef) return JSON.stringify({ error: "canvasRef not ready" });
+
+        const dm = canvasRef.dataManager;
+        const c = canvasRef.getGlobalProps().store.getState();
+        const main = c0?.dataStore?.getState()?.main;
+        const mainData = main ? main.mainChartData || [] : [];
+
+        // Build OHLC and Open Interest lookup map keyed by exact timestamp
+        const ohlcMap = {};
+        for (let b of mainData) {
+            const ts = b.luxon_date?.ts || (b.date_str ? new Date(b.date_str).getTime() : null);
+            if (ts) {
+                ohlcMap[ts] = b;
+            }
+        }
+
+        // Retrieve footprint data from timeSeriesStoreMap
+        const rootStore = c.transient?.rootStore?.getState();
+        const tsm = rootStore?.transient?.timeSeriesStoreMap;
+        let fpMap = null;
+
+        if (tsm) {
+            for (let k of tsm.keys()) {
+                const sub = tsm.get(k)?.getState();
+                if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
+                    fpMap = sub.footprint;
+                    break;
+                }
+            }
+        }
+
+        if (!fpMap) return JSON.stringify({ error: "Footprint data map not found in timeSeriesStoreMap." });
+
+        const dates = Object.keys(fpMap).sort();
+        const latestDate = dates[dates.length - 1];
+        const fpForDate = fpMap[latestDate];
+        const candles = fpForDate.candles || [];
+        const clusterMap = new Map();
+        const tpo = dm.tpo || { value: 6, precision: 1 };
+
+        const results = [];
+        for (let candle of candles) {
+            const candleDate = new Date(candle.date);
+            const ts = candleDate.getTime();
+            
+            dm.buildClusterForCandle(canvasRef, fpForDate, candle, { date: candleDate }, tpo, clusterMap);
+            const cluster = clusterMap.get(ts);
+            const ohlc = ohlcMap[ts] || {};
+            const volTotals = cluster?.candleLevelTotals?.volume || {};
+            const priceDivisor = cluster?.price_divisor || 10;
+
+            const levels = [];
+            if (cluster && cluster.clusterForCandle) {
+                for (let [lvl, val] of cluster.clusterForCandle.entries()) {
+                    levels.push({
+                        price: lvl / priceDivisor,
+                        buy_vol: val.volume.buy,
+                        sell_vol: val.volume.sell,
+                        delta: val.volume.buy - val.volume.sell,
+                        total_vol: val.volume.total,
+                        buy_trades: val.trades.buy,
+                        sell_trades: val.trades.sell
+                    });
+                }
+            }
+            levels.sort((a, b) => a.price - b.price);
+
+            const pocPrice = volTotals.poc ? volTotals.poc / priceDivisor : (levels.length > 0 ? levels[0].price : 0);
+            const buyVol = volTotals.buy !== undefined ? volTotals.buy : levels.reduce((s, x) => s + x.buy_vol, 0);
+            const sellVol = volTotals.sell !== undefined ? volTotals.sell : levels.reduce((s, x) => s + x.sell_vol, 0);
+            const netDelta = buyVol - sellVol;
+            const minDelta = volTotals.deltaMin !== undefined ? volTotals.deltaMin : netDelta;
+            const maxDelta = volTotals.deltaMax !== undefined ? volTotals.deltaMax : netDelta;
+
+            results.push({
+                timestamp: candleDate.toISOString(),
+                date_str: candle.date,
+                open: ohlc.open !== undefined ? ohlc.open : (levels.length > 0 ? levels[0].price : 0),
+                high: ohlc.high !== undefined ? ohlc.high : (levels.length > 0 ? levels[levels.length - 1].price : 0),
+                low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
+                close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
+                volume: ohlc.volume !== undefined ? ohlc.volume : (buyVol + sellVol),
+                total_buy_vol: buyVol,
+                total_sell_vol: sellVol,
+                net_delta: netDelta,
+                min_delta: minDelta,
+                max_delta: maxDelta,
+                open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
+                oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
+                oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
+                oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
+                poc_price: pocPrice,
+                levels: levels
+            });
+        }
+
+        const symbol = c.security ? c.security.ticker : "NSE:NIFTY-I";
+        return JSON.stringify({
+            status: "ok",
+            symbol: symbol,
+            session_date: latestDate,
+            candlesCount: results.length,
+            candles: results
+        });
+    } catch(e) {
+        return JSON.stringify({ error: e.toString() });
+    }
+})()
+"""
+
 
 class GoChartingBrowserController:
     def __init__(self, port: int = CDP_PORT):
         self.port = port
 
-    def _get_page_ws_url(self) -> Optional[str]:
+    def get_all_gocharting_tabs(self) -> List[Dict[str, Any]]:
+        """Returns metadata and websocket URLs for ALL open GoCharting tabs in Chrome."""
         try:
             url = f"http://localhost:{self.port}/json/list"
             req = urllib.request.urlopen(url, timeout=3)
             pages = json.loads(req.read().decode())
-            # Find the GoCharting tab
-            for p in pages:
-                if "gocharting.com" in p.get("url", "") and p.get("type") == "page":
-                    return p.get("webSocketDebuggerUrl")
-            # If not found, return first active page
-            for p in pages:
-                if p.get("type") == "page":
-                    return p.get("webSocketDebuggerUrl")
+            return [p for p in pages if "gocharting.com" in p.get("url", "") and p.get("type") == "page"]
         except Exception as e:
             print(f"[CDP Controller] Failed to connect to Chrome on port {self.port}: {e}")
-            return None
-        return None
+            return []
 
-    async def execute_js(self, expression: str) -> Any:
-        """Executes JavaScript inside the GoCharting tab via CDP."""
-        ws_url = self._get_page_ws_url()
-        if not ws_url:
-            return {"error": "Bot Chrome instance not detected on port 9222. Ensure launch_bot_chrome.sh is running."}
+    def _get_page_ws_url(self) -> Optional[str]:
+        tabs = self.get_all_gocharting_tabs()
+        return tabs[0]["webSocketDebuggerUrl"] if tabs else None
 
-        async with websockets.connect(ws_url, max_size=20_000_000) as ws:
-            req = {
-                "id": 1,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": expression,
-                    "returnByValue": True,
-                    "awaitPromise": True
+    async def execute_js_on_tab(self, ws_url: str, expression: str) -> Any:
+        """Executes JavaScript inside a specific tab via CDP."""
+        try:
+            async with websockets.connect(ws_url, max_size=25_000_000) as ws:
+                req = {
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expression,
+                        "returnByValue": True,
+                        "awaitPromise": True
+                    }
                 }
-            }
-            await ws.send(json.dumps(req))
-            resp = json.loads(await ws.recv())
-            res = resp.get("result", {}).get("result", {})
-            return res.get("value")
+                await ws.send(json.dumps(req))
+                resp = json.loads(await ws.recv())
+                res = resp.get("result", {}).get("result", {})
+                return res.get("value")
+        except Exception as e:
+            return {"error": str(e)}
 
-    async def change_symbol(self, symbol: str) -> Dict[str, Any]:
-        """Switches the chart symbol (e.g. 'NSE:NIFTY-I', 'NSE:BANKNIFTY-I', 'NIFTY 24300 CE')."""
+    async def execute_js(self, expression: str, tab_index: int = 0) -> Any:
+        """Executes JavaScript inside the primary GoCharting tab via CDP."""
+        tabs = self.get_all_gocharting_tabs()
+        if not tabs:
+            return {"error": "Bot Chrome instance not detected on port 9222. Ensure launch_bot_chrome.sh is running."}
+        idx = min(tab_index, len(tabs) - 1)
+        return await self.execute_js_on_tab(tabs[idx]["webSocketDebuggerUrl"], expression)
+
+    async def open_new_tab(self, url: str = "https://gocharting.com/terminal/chart/yDoy4eLHt") -> Dict[str, Any]:
+        """
+        Opens a new simultaneous GoCharting chart tab in Chrome.
+        Allows having Tab 1 on NIFTY Futures and Tab 2 on an ATM Option strike.
+        """
+        try:
+            new_tab_url = f"http://localhost:{self.port}/json/new?{quote(url, safe=':/?=')}"
+            req = urllib.request.Request(new_tab_url, method="PUT")
+            res = urllib.request.urlopen(req, timeout=5)
+            tab_info = json.loads(res.read().decode())
+            return {
+                "status": "ok",
+                "message": "Opened new GoCharting tab successfully.",
+                "tab_id": tab_info.get("id"),
+                "url": tab_info.get("url")
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to open new tab: {e}"}
+
+    async def change_symbol(self, symbol: str, tab_index: int = 0) -> Dict[str, Any]:
+        """Switches the chart symbol in the specified GoCharting tab (defaults to primary tab)."""
         js = f"""
         (async () => {{
             const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
@@ -95,10 +233,10 @@ class GoChartingBrowserController:
             return {{ status: "failed", message: "Search element not found" }};
         }})()
         """
-        return await self.execute_js(js)
+        return await self.execute_js(js, tab_index=tab_index)
 
-    async def change_timeframe(self, interval: str = "1m") -> Dict[str, Any]:
-        """Changes chart timeframe (e.g. '1m', '3m', '5m', '15m')."""
+    async def change_timeframe(self, interval: str = "1m", tab_index: int = 0) -> Dict[str, Any]:
+        """Changes chart timeframe in the specified tab."""
         js = f"""
         (async () => {{
             const intervalBtn = document.querySelector('.interval') || document.querySelector('.ohlc-interval-button');
@@ -116,10 +254,10 @@ class GoChartingBrowserController:
             return {{ status: "failed", message: "Interval element not found" }};
         }})()
         """
-        return await self.execute_js(js)
+        return await self.execute_js(js, tab_index=tab_index)
 
-    async def open_tool_or_study(self, tool_name: str) -> Dict[str, Any]:
-        """Opens a study or indicator dialog (e.g., 'VWAP', 'CVD', 'Profile')."""
+    async def open_tool_or_study(self, tool_name: str, tab_index: int = 0) -> Dict[str, Any]:
+        """Opens a study or indicator dialog in the specified tab."""
         js = f"""
         (async () => {{
             const studyBtn = Array.from(document.querySelectorAll('button, div')).find(el => el.innerText.trim() === 'Study');
@@ -143,139 +281,40 @@ class GoChartingBrowserController:
             return {{ status: "failed", message: "Study button or tool not found" }};
         }})()
         """
-        return await self.execute_js(js)
+        return await self.execute_js(js, tab_index=tab_index)
 
-    async def extract_live_footprint_from_chart(self) -> Dict[str, Any]:
-        """
-        Extracts all 1-minute footprint candles of the active trading session directly from GoCharting's
-        timeSeriesStoreMap and dataManager.
-        Guarantees:
-        - Full trading day coverage (from 09:15 morning open to post-market close)
-        - Exact deltaMin and deltaMax per candle
-        - Correct OHLC and Open Interest mapping
-        - Full price ladder with buy/sell tick volumes
-        """
-        js = """
-        (() => {
-            try {
-                const c0 = window.rootReduxStore?.getState()?.chartComponentList?.[0];
-                const canvasRef = c0?.store?.getState()?.transient?.chartCanvasRef?.current;
-                if (!canvasRef) return JSON.stringify({ error: "canvasRef not ready" });
-
-                const dm = canvasRef.dataManager;
-                const c = canvasRef.getGlobalProps().store.getState();
-                const main = c0?.dataStore?.getState()?.main;
-                const mainData = main ? main.mainChartData || [] : [];
-
-                // Build OHLC and Open Interest lookup map keyed by exact timestamp
-                const ohlcMap = {};
-                for (let b of mainData) {
-                    const ts = b.luxon_date?.ts || (b.date_str ? new Date(b.date_str).getTime() : null);
-                    if (ts) {
-                        ohlcMap[ts] = b;
-                    }
-                }
-
-                // Retrieve footprint data from timeSeriesStoreMap
-                const rootStore = c.transient?.rootStore?.getState();
-                const tsm = rootStore?.transient?.timeSeriesStoreMap;
-                let fpMap = null;
-
-                if (tsm) {
-                    for (let k of tsm.keys()) {
-                        const sub = tsm.get(k)?.getState();
-                        if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
-                            fpMap = sub.footprint;
-                            break;
-                        }
-                    }
-                }
-
-                if (!fpMap) return JSON.stringify({ error: "Footprint data map not found in timeSeriesStoreMap." });
-
-                const dates = Object.keys(fpMap).sort();
-                const latestDate = dates[dates.length - 1];
-                const fpForDate = fpMap[latestDate];
-                const candles = fpForDate.candles || [];
-                const clusterMap = new Map();
-                const tpo = dm.tpo || { value: 6, precision: 1 };
-
-                const results = [];
-                for (let candle of candles) {
-                    const candleDate = new Date(candle.date);
-                    const ts = candleDate.getTime();
-                    
-                    dm.buildClusterForCandle(canvasRef, fpForDate, candle, { date: candleDate }, tpo, clusterMap);
-                    const cluster = clusterMap.get(ts);
-                    const ohlc = ohlcMap[ts] || {};
-                    const volTotals = cluster?.candleLevelTotals?.volume || {};
-                    const priceDivisor = cluster?.price_divisor || 10;
-
-                    const levels = [];
-                    if (cluster && cluster.clusterForCandle) {
-                        for (let [lvl, val] of cluster.clusterForCandle.entries()) {
-                            levels.push({
-                                price: lvl / priceDivisor,
-                                buy_vol: val.volume.buy,
-                                sell_vol: val.volume.sell,
-                                delta: val.volume.buy - val.volume.sell,
-                                total_vol: val.volume.total,
-                                buy_trades: val.trades.buy,
-                                sell_trades: val.trades.sell
-                            });
-                        }
-                    }
-                    levels.sort((a, b) => a.price - b.price);
-
-                    const pocPrice = volTotals.poc ? volTotals.poc / priceDivisor : (levels.length > 0 ? levels[0].price : 0);
-                    const buyVol = volTotals.buy !== undefined ? volTotals.buy : levels.reduce((s, x) => s + x.buy_vol, 0);
-                    const sellVol = volTotals.sell !== undefined ? volTotals.sell : levels.reduce((s, x) => s + x.sell_vol, 0);
-                    const netDelta = buyVol - sellVol;
-                    const minDelta = volTotals.deltaMin !== undefined ? volTotals.deltaMin : netDelta;
-                    const maxDelta = volTotals.deltaMax !== undefined ? volTotals.deltaMax : netDelta;
-
-                    results.push({
-                        timestamp: candleDate.toISOString(),
-                        date_str: candle.date,
-                        open: ohlc.open !== undefined ? ohlc.open : (levels.length > 0 ? levels[0].price : 0),
-                        high: ohlc.high !== undefined ? ohlc.high : (levels.length > 0 ? levels[levels.length - 1].price : 0),
-                        low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
-                        close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
-                        volume: ohlc.volume !== undefined ? ohlc.volume : (buyVol + sellVol),
-                        total_buy_vol: buyVol,
-                        total_sell_vol: sellVol,
-                        net_delta: netDelta,
-                        min_delta: minDelta,
-                        max_delta: maxDelta,
-                        open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
-                        oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
-                        oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
-                        oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
-                        poc_price: pocPrice,
-                        levels: levels
-                    });
-                }
-
-                const symbol = c.security ? c.security.ticker : "NSE:NIFTY-I";
-                return JSON.stringify({
-                    status: "ok",
-                    symbol: symbol,
-                    session_date: latestDate,
-                    candlesCount: results.length,
-                    candles: results
-                });
-            } catch(e) {
-                return JSON.stringify({ error: e.toString() });
-            }
-        })()
-        """
-        res_str = await self.execute_js(js)
+    async def extract_footprint_from_single_tab(self, ws_url: str) -> Dict[str, Any]:
+        """Extracts footprint candles from a specific tab websocket URL."""
+        res_str = await self.execute_js_on_tab(ws_url, FOOTPRINT_EXTRACTION_JS)
         if isinstance(res_str, str):
             try:
                 return json.loads(res_str)
             except Exception:
                 return {"raw": res_str}
         return res_str or {}
+
+    async def extract_live_footprint_from_all_tabs(self) -> List[Dict[str, Any]]:
+        """
+        Extracts 1-minute footprint candles from ALL open GoCharting tabs concurrently.
+        Supports simultaneous multi-tab streaming (e.g., NIFTY Futures tab + ATM Option tab).
+        """
+        tabs = self.get_all_gocharting_tabs()
+        if not tabs:
+            return []
+
+        tasks = [self.extract_footprint_from_single_tab(t["webSocketDebuggerUrl"]) for t in tabs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        valid_series = []
+        for r in results:
+            if isinstance(r, dict) and r.get("status") == "ok":
+                valid_series.append(r)
+        return valid_series
+
+    async def extract_live_footprint_from_chart(self) -> Dict[str, Any]:
+        """Extracts footprint from the primary tab (or first valid tab)."""
+        series = await self.extract_live_footprint_from_all_tabs()
+        return series[0] if series else {}
 
     async def extract_spot_and_options_context(self, symbol: str = "NIFTY") -> Dict[str, Any]:
         """
@@ -313,6 +352,7 @@ class GoChartingBrowserController:
                 const spotPrice = firstSeries.underlying_price || null;
                 const basis = (futuresPrice !== null && spotPrice !== null) ? Number((futuresPrice - spotPrice).toFixed(2)) : null;
                 const basisPct = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 100).toFixed(4)) : null;
+                const basisBps = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 10000).toFixed(2)) : null;
 
                 let basisState = 'PARITY';
                 if (basis !== null) {
@@ -324,8 +364,6 @@ class GoChartingBrowserController:
                 const strikeStep = 50;
                 const spotAtmStrike = spotPrice ? Math.round(spotPrice / strikeStep) * strikeStep : null;
                 const futuresAtmStrike = futuresPrice ? Math.round(futuresPrice / strikeStep) * strikeStep : null;
-
-                const basisBps = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 10000).toFixed(2)) : null;
 
                 const rawDte = firstSeries.dte;
                 const dteExactDays = rawDte !== undefined && rawDte !== null ? Number(rawDte.toFixed(1)) : null;
@@ -369,11 +407,13 @@ class GoChartingBrowserController:
         res = await self.execute_js(js)
         return res if isinstance(res, dict) else {"error": str(res)}
 
-    async def capture_screenshot(self, output_path: str = "chart_screenshot.png") -> Dict[str, Any]:
+    async def capture_screenshot(self, output_path: str = "chart_screenshot.png", tab_index: int = 0) -> Dict[str, Any]:
         """Captures a full screenshot of the active GoCharting window."""
-        ws_url = self._get_page_ws_url()
-        if not ws_url:
+        tabs = self.get_all_gocharting_tabs()
+        if not tabs:
             return {"error": "Browser not connected"}
+        idx = min(tab_index, len(tabs) - 1)
+        ws_url = tabs[idx]["webSocketDebuggerUrl"]
 
         async with websockets.connect(ws_url) as ws:
             req = {"id": 2, "method": "Page.captureScreenshot", "params": {"format": "png"}}

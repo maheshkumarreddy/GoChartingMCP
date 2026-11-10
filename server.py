@@ -29,11 +29,12 @@ mcp = MCPServer(name="GoCharting-OrderFlow-MCP")
 
 
 async def auto_sync_if_needed():
-    """Fetches latest footprint data from the dedicated Chrome tab via CDP."""
+    """Fetches latest footprint data from ALL open GoCharting tabs via CDP in parallel."""
     try:
-        data = await controller.extract_live_footprint_from_chart()
-        if data and data.get("status") == "ok":
-            store.sync_from_browser_series(data)
+        series_list = await controller.extract_live_footprint_from_all_tabs()
+        for series in series_list:
+            if series and series.get("status") == "ok":
+                store.sync_from_browser_series(series)
     except Exception as e:
         print(f"[AutoSync Warning] {e}")
 
@@ -57,7 +58,7 @@ def _verify_admin_access(token: Optional[str] = None) -> Optional[Dict[str, Any]
 async def browser_sync_now() -> Dict[str, Any]:
     """
     Forces an immediate live sync of order flow footprint candles directly
-    from the open GoCharting browser tab.
+    from ALL open GoCharting browser tabs.
     Returns synced symbols, candle counts, market session status, and data staleness indicators.
     """
     await auto_sync_if_needed()
@@ -72,6 +73,20 @@ async def browser_sync_now() -> Dict[str, Any]:
         "data_age_seconds": session_info["data_age_seconds"],
         "staleness_warning": session_info["staleness_warning"]
     }
+
+
+@mcp.tool()
+async def browser_open_chart_tab(url: str = "https://gocharting.com/terminal/chart/yDoy4eLHt", admin_token: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Opens an additional simultaneous GoCharting chart tab in Chrome (e.g. for an ATM option strike
+    or secondary contract) without disturbing existing open tabs.
+    Both tabs stream and cache in parallel without any tab switching.
+    Optionally gated by admin_token if MCP_ADMIN_TOKEN environment variable is set.
+    """
+    auth_err = _verify_admin_access(admin_token)
+    if auth_err:
+        return auth_err
+    return await controller.open_new_tab(url)
 
 
 @mcp.tool()

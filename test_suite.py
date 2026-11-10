@@ -240,6 +240,29 @@ async def run_tests():
         print(f"   ❌ FAIL: {e}")
 
     # ---------------------------------------------------------
+    # Test 11: Simultaneous Multi-Tab & Option Strike Separation
+    # ---------------------------------------------------------
+    total += 1
+    print("\n[Test 11] Testing Simultaneous Multi-Tab Streaming & Option Strike Separation...")
+    try:
+        from orderflow_store import normalize_symbol
+        fut_sym = normalize_symbol("NSE:NIFTY-I")
+        opt_sym = normalize_symbol("NSE:NIFTY24N1225050CE")
+        opt_space = normalize_symbol("NIFTY 25050 CE")
+
+        if fut_sym == "NIFTY_FUT" and opt_sym == "NIFTY24N1225050CE" and opt_space == "NIFTY 25050 CE":
+            # Test multi-series extraction from all tabs
+            all_series = await controller.extract_live_footprint_from_all_tabs()
+            tabs = controller.get_all_gocharting_tabs()
+            print(f"   ✅ PASS: Multi-tab controller detected {len(tabs)} open tab(s); extracted {len(all_series)} series concurrently.")
+            print(f"            Futures normalized: '{fut_sym}' | Option strike preserved: '{opt_sym}' (no collision).")
+            passed += 1
+        else:
+            print(f"   ❌ FAIL: Symbol collision: fut='{fut_sym}', opt='{opt_sym}'")
+    except Exception as e:
+        print(f"   ❌ FAIL: {e}")
+
+    # ---------------------------------------------------------
     # Summary
     # ---------------------------------------------------------
     print("\n" + "=" * 75)
