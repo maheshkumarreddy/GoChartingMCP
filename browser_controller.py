@@ -11,10 +11,11 @@ Supports simultaneous multi-tab streaming:
 import json
 import base64
 import asyncio
+import re
 import urllib.request
 from urllib.parse import quote
 import websockets
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 
 CDP_PORT = 9222
@@ -236,46 +237,155 @@ class GoChartingBrowserController:
                 return 0
         return 0
 
+    @staticmethod
+    def parse_option_symbol(symbol: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Parses option strike and type (CE/PE) from inputs like '25000 PE', '25050CE', 'NIFTY 25000 PE', etc."""
+        m = re.search(r'(\d{5})\s*(CE|PE|CALL|PUT)', symbol, re.I)
+        if m:
+            strike = m.group(1)
+            t = m.group(2).upper()
+            opt_type = 'CE' if ('CE' in t or 'CALL' in t) else 'PE'
+            return True, strike, opt_type
+        m2 = re.search(r'(CE|PE|CALL|PUT)\s*(\d{5})', symbol, re.I)
+        if m2:
+            t = m2.group(1).upper()
+            strike = m2.group(2)
+            opt_type = 'CE' if ('CE' in t or 'CALL' in t) else 'PE'
+            return True, strike, opt_type
+        return False, None, None
+
     async def change_symbol(self, symbol: str, tab_index: Optional[int] = None, target_tab: Optional[str] = None) -> Dict[str, Any]:
-        """Switches the chart symbol in the specified GoCharting tab (defaults to target_tab='OPTION' if multiple tabs exist)."""
+        """Switches the chart symbol in the specified GoCharting tab (defaults to target_tab='OPTION' if multiple tabs exist).
+        Supports fully automated strike selection from the GoCharting NIFTY OPTIONS Chain modal."""
+        is_opt, strike, opt_type = self.parse_option_symbol(symbol)
+        if target_tab is None and is_opt:
+            target_tab = "OPTION"
+            
         idx = self.find_tab_by_target(target=target_tab, tab_index=tab_index)
-        js = f"""
-        (async () => {{
-            const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
-                              document.querySelector('.ohlc-symbol-button') ||
-                              document.querySelector('.popovers-trigger button') ||
-                              document.querySelector('.symbol-title');
-            if (searchBtn) {{
-                searchBtn.click();
-                await new Promise(r => setTimeout(r, 400));
-                
-                const input = document.querySelector('.symbol-search-input input') ||
-                              document.querySelector('input[placeholder*="Search"]') ||
-                              document.querySelector('input[type="text"]');
-                if (input) {{
-                    input.focus();
-                    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-                    if (nativeSetter) {{
-                        nativeSetter.call(input, '{symbol}');
-                    }} else {{
-                        input.value = '{symbol}';
+        
+        if is_opt and strike and opt_type:
+            is_call_js = "true" if opt_type == "CE" else "false"
+            js = f"""
+            (async () => {{
+                const strike = "{strike}";
+                const isCall = {is_call_js};
+                const colClass = isCall ? '.call' : '.put';
+
+                const isChainOpen = () => Array.from(document.querySelectorAll('*')).some(el =>
+                    (el.textContent || '').includes('OPTIONS Chain') && el.children.length < 5
+                );
+
+                const selectStrikeFromChain = () => {{
+                    const cells = Array.from(document.querySelectorAll(colClass));
+                    const match = cells.find(el => (el.textContent || '').includes(strike));
+                    if (match) {{
+                        const clickTarget = match.querySelector('span') || match;
+                        clickTarget.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        clickTarget.click();
+                        return true;
                     }}
-                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    await new Promise(r => setTimeout(r, 600));
-                    
-                    const firstResult = document.querySelector('.symbol-item') || document.querySelector('[data-qa*="search-result"]');
-                    if (firstResult) {{
-                        firstResult.click();
-                    }} else {{
-                        input.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+                    return false;
+                }};
+
+                // 1. If Options Chain modal is already visible, select directly!
+                if (isChainOpen()) {{
+                    if (selectStrikeFromChain()) {{
+                        await new Promise(r => setTimeout(r, 600));
+                        return {{ status: "ok", method: "direct_modal", symbol: "{symbol}", strike: strike, type: isCall ? "CE" : "PE", tab_index: {idx} }};
                     }}
-                    return {{ status: "ok", symbol: "{symbol}", tab_index: {idx} }};
                 }}
-            }}
-            return {{ status: "failed", message: "Search element not found", tab_index: {idx} }};
-        }})()
-        """
+
+                // 2. If search dialog not open, open it
+                const isSearchOpen = () => {{
+                    const d = document.querySelector('[class*="erbwhql110"]');
+                    return d && d.clientHeight > 100;
+                }};
+
+                if (!isSearchOpen()) {{
+                    const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
+                                      document.querySelector('.ohlc-symbol-button') ||
+                                      document.querySelector('.css-1gi9g8n');
+                    if (searchBtn) {{
+                        searchBtn.click();
+                        await new Promise(r => setTimeout(r, 600));
+                    }}
+                }}
+
+                // 3. Click 'Options' filter tab
+                const optTab = Array.from(document.querySelectorAll('button')).find(b => 
+                    (b.textContent || '').trim() === 'Options'
+                );
+                if (optTab) {{
+                    optTab.click();
+                    await new Promise(r => setTimeout(r, 400));
+                }}
+
+                // 4. Click 'NIFTY OPTIONS' leaf row to open Chain modal
+                const optItem = Array.from(document.querySelectorAll('div, span')).find(el => 
+                    el.children.length === 0 && (el.textContent || '').trim() === 'NIFTY OPTIONS'
+                );
+                if (optItem) {{
+                    optItem.click();
+                    await new Promise(r => setTimeout(r, 700));
+                }}
+
+                // 5. Select the strike from the opened chain
+                if (selectStrikeFromChain()) {{
+                    await new Promise(r => setTimeout(r, 600));
+                    return {{ status: "ok", method: "opened_chain_and_selected", symbol: "{symbol}", strike: strike, type: isCall ? "CE" : "PE", tab_index: {idx} }};
+                }}
+
+                return {{ status: "failed", message: "Strike " + strike + " not found in options chain", tab_index: {idx} }};
+            }})()
+            """
+        else:
+            js = f"""
+            (async () => {{
+                // Dismiss options chain modal if open
+                const closeBtn = Array.from(document.querySelectorAll('button, span')).find(b => 
+                    (b.textContent === '×' || b.textContent === '✕') && b.className && b.className.includes('css-')
+                );
+                if (closeBtn) {{
+                    closeBtn.click();
+                    await new Promise(r => setTimeout(r, 400));
+                }}
+
+                const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
+                                  document.querySelector('.ohlc-symbol-button') ||
+                                  document.querySelector('.popovers-trigger button') ||
+                                  document.querySelector('.css-1gi9g8n') ||
+                                  document.querySelector('.symbol-title');
+                if (searchBtn) {{
+                    searchBtn.click();
+                    await new Promise(r => setTimeout(r, 400));
+                    
+                    const input = document.querySelector('.symbol-search-input input') ||
+                                  document.querySelector('input[placeholder*="Search"]') ||
+                                  document.querySelector('input[type="text"]');
+                    if (input) {{
+                        input.focus();
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                        if (nativeSetter) {{
+                            nativeSetter.call(input, '{symbol}');
+                        }} else {{
+                            input.value = '{symbol}';
+                        }}
+                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        await new Promise(r => setTimeout(r, 600));
+                        
+                        const firstResult = document.querySelector('.symbol-item') || document.querySelector('[data-qa*="search-result"]');
+                        if (firstResult) {{
+                            firstResult.click();
+                        }} else {{
+                            input.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+                        }}
+                        return {{ status: "ok", symbol: "{symbol}", tab_index: {idx} }};
+                    }}
+                }}
+                return {{ status: "failed", message: "Search element not found", tab_index: {idx} }};
+            }})()
+            """
         return await self.execute_js(js, tab_index=idx)
 
     async def change_timeframe(self, interval: str = "1m", tab_index: int = 0) -> Dict[str, Any]:
