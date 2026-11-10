@@ -41,17 +41,33 @@ FOOTPRINT_EXTRACTION_JS = """
             }
         }
 
-        // Retrieve footprint data from timeSeriesStoreMap
+        // Retrieve footprint data from timeSeriesStoreMap matching active ticker
         const rootStore = c.transient?.rootStore?.getState();
         const tsm = rootStore?.transient?.timeSeriesStoreMap;
+        const activeTicker = c?.security?.ticker || c?.security?.symbol || "";
         let fpMap = null;
 
         if (tsm) {
-            for (let k of tsm.keys()) {
-                const sub = tsm.get(k)?.getState();
-                if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
-                    fpMap = sub.footprint;
-                    break;
+            // 1. Strict match: find store matching the active ticker
+            if (activeTicker) {
+                for (let k of tsm.keys()) {
+                    if (k.includes(activeTicker)) {
+                        const sub = tsm.get(k)?.getState();
+                        if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
+                            fpMap = sub.footprint;
+                            break;
+                        }
+                    }
+                }
+            }
+            // 2. Fallback to any valid footprint if not keyed by activeTicker
+            if (!fpMap) {
+                for (let k of tsm.keys()) {
+                    const sub = tsm.get(k)?.getState();
+                    if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
+                        fpMap = sub.footprint;
+                        break;
+                    }
                 }
             }
         }
@@ -380,7 +396,8 @@ class GoChartingBrowserController:
                 const clickTarget = targetCell.querySelector('span') || targetCell;
                 clickTarget.scrollIntoView({{ block: 'center', inline: 'center' }});
                 clickTarget.click();
-                await new Promise(r => setTimeout(r, 600));
+                // Allow GoCharting WebSocket time to stream new footprint candles
+                await new Promise(r => setTimeout(r, 1500));
 
                 const closeBtn = document.querySelector('.css-1mft2lf');
                 if (closeBtn) closeBtn.click();
