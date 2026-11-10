@@ -213,24 +213,55 @@ class GoChartingBrowserController:
         except Exception as e:
             return {"status": "error", "message": f"Failed to open new tab: {e}"}
 
-    async def change_symbol(self, symbol: str, tab_index: int = 0) -> Dict[str, Any]:
-        """Switches the chart symbol in the specified GoCharting tab (defaults to primary tab)."""
+    def find_tab_by_target(self, target: Optional[str] = None, tab_index: Optional[int] = None) -> int:
+        """Finds the correct tab index based on target role ('OPTION' or 'FUTURES') or explicit index."""
+        tabs = self.get_all_gocharting_tabs()
+        if not tabs:
+            return 0
+        if tab_index is not None:
+            return min(max(0, tab_index), len(tabs) - 1)
+        if target:
+            target_upper = target.upper()
+            if target_upper in ["OPTION", "OPTIONS", "OPT", "STRIKE"]:
+                for idx, t in enumerate(tabs):
+                    title_upper = t.get("title", "").upper()
+                    if " CE" in title_upper or " PE" in title_upper or "CE" in title_upper or "PE" in title_upper:
+                        return idx
+                return 1 if len(tabs) > 1 else 0
+            elif target_upper in ["FUT", "FUTURES", "FUTURE"]:
+                for idx, t in enumerate(tabs):
+                    title_upper = t.get("title", "").upper()
+                    if "-I" in title_upper or "FUT" in title_upper:
+                        return idx
+                return 0
+        return 0
+
+    async def change_symbol(self, symbol: str, tab_index: Optional[int] = None, target_tab: Optional[str] = None) -> Dict[str, Any]:
+        """Switches the chart symbol in the specified GoCharting tab (defaults to target_tab='OPTION' if multiple tabs exist)."""
+        idx = self.find_tab_by_target(target=target_tab, tab_index=tab_index)
         js = f"""
         (async () => {{
             const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
                               document.querySelector('.ohlc-symbol-button') ||
+                              document.querySelector('.popovers-trigger button') ||
                               document.querySelector('.symbol-title');
             if (searchBtn) {{
                 searchBtn.click();
                 await new Promise(r => setTimeout(r, 400));
                 
-                const input = document.querySelector('input[placeholder*="Search"]') ||
-                              document.querySelector('.symbol-search-input input') ||
+                const input = document.querySelector('.symbol-search-input input') ||
+                              document.querySelector('input[placeholder*="Search"]') ||
                               document.querySelector('input[type="text"]');
                 if (input) {{
                     input.focus();
-                    input.value = '{symbol}';
+                    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                    if (nativeSetter) {{
+                        nativeSetter.call(input, '{symbol}');
+                    }} else {{
+                        input.value = '{symbol}';
+                    }}
                     input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     await new Promise(r => setTimeout(r, 600));
                     
                     const firstResult = document.querySelector('.symbol-item') || document.querySelector('[data-qa*="search-result"]');
@@ -239,13 +270,13 @@ class GoChartingBrowserController:
                     }} else {{
                         input.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
                     }}
-                    return {{ status: "ok", symbol: "{symbol}" }};
+                    return {{ status: "ok", symbol: "{symbol}", tab_index: {idx} }};
                 }}
             }}
-            return {{ status: "failed", message: "Search element not found" }};
+            return {{ status: "failed", message: "Search element not found", tab_index: {idx} }};
         }})()
         """
-        return await self.execute_js(js, tab_index=tab_index)
+        return await self.execute_js(js, tab_index=idx)
 
     async def change_timeframe(self, interval: str = "1m", tab_index: int = 0) -> Dict[str, Any]:
         """Changes chart timeframe in the specified tab."""

@@ -90,16 +90,26 @@ async def browser_open_chart_tab(url: str = "https://gocharting.com/terminal/cha
 
 
 @mcp.tool()
-async def browser_change_symbol(symbol: str, admin_token: Optional[str] = None) -> Dict[str, Any]:
+async def browser_change_symbol(
+    symbol: str,
+    target_tab: Optional[str] = "OPTION",
+    tab_index: Optional[int] = None,
+    admin_token: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Directly changes the chart symbol in the GoCharting browser window
-    (e.g., 'NSE:NIFTY-I', 'NSE:BANKNIFTY-I', 'NIFTY 24300 CE').
-    Optionally gated by admin_token if MCP_ADMIN_TOKEN environment variable is set.
+    (e.g., 'NSE:NIFTY24N1225050CE', 'NIFTY 25050 CE', 'NSE:BANKNIFTY-I').
+    
+    Parameters:
+    - symbol: Target ticker or contract name (e.g. 'NIFTY 25050 CE')
+    - target_tab: Target tab to update ('OPTION' to change the option tab without touching Futures; 'FUTURES' to change futures).
+    - tab_index: Optional explicit index (0, 1) of the tab to retarget.
+    - admin_token: Required if MCP_ADMIN_TOKEN is configured in environment.
     """
     auth_err = _verify_admin_access(admin_token)
     if auth_err:
         return auth_err
-    return await controller.change_symbol(symbol)
+    return await controller.change_symbol(symbol=symbol, tab_index=tab_index, target_tab=target_tab)
 
 
 @mcp.tool()
