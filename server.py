@@ -92,16 +92,19 @@ async def browser_open_chart_tab(url: str = "https://gocharting.com/terminal/cha
 @mcp.tool()
 async def browser_change_symbol(
     symbol: str,
+    expiry: Optional[str] = None,
     target_tab: Optional[str] = "OPTION",
     tab_index: Optional[int] = None,
     admin_token: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Directly changes the chart symbol in the GoCharting browser window
-    (e.g., 'NSE:NIFTY24N1225050CE', 'NIFTY 25050 CE', 'NSE:BANKNIFTY-I').
+    Directly changes the chart symbol and optional expiry in the GoCharting browser window
+    (e.g., '25000 PE', '25050 CE', '25100 CE', 'NSE:BANKNIFTY-I').
     
     Parameters:
-    - symbol: Target ticker or contract name (e.g. 'NIFTY 25050 CE')
+    - symbol: Target ticker or contract name (e.g. '25000 PE', '25050 CE', 'NIFTY 25100 CE', '25000 PE 2026-11-23').
+    - expiry: Optional target expiry date (e.g. '2026-11-17', '2026-11-23', '17-NOV', '23-NOV').
+              Defaults to current active expiry if not specified.
     - target_tab: Target tab to update ('OPTION' to change the option tab without touching Futures; 'FUTURES' to change futures).
     - tab_index: Optional explicit index (0, 1) of the tab to retarget.
     - admin_token: Required if MCP_ADMIN_TOKEN is configured in environment.
@@ -109,7 +112,7 @@ async def browser_change_symbol(
     auth_err = _verify_admin_access(admin_token)
     if auth_err:
         return auth_err
-    return await controller.change_symbol(symbol=symbol, tab_index=tab_index, target_tab=target_tab)
+    return await controller.change_symbol(symbol=symbol, expiry=expiry, tab_index=tab_index, target_tab=target_tab)
 
 
 @mcp.tool()

@@ -238,104 +238,163 @@ class GoChartingBrowserController:
         return 0
 
     @staticmethod
-    def parse_option_symbol(symbol: str) -> Tuple[bool, Optional[str], Optional[str]]:
-        """Parses option strike and type (CE/PE) from inputs like '25000 PE', '25050CE', 'NIFTY 25000 PE', etc."""
+    def parse_option_symbol(symbol: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+        """Parses option strike, type (CE/PE), and optional expiry date from inputs like:
+        '25000 PE', '25050 CE 2026-11-23', 'NIFTY 17 NOV 25100 CE', 'NSE:NIFTY26N1725000PE'.
+        """
+        # Look for explicit YYYY-MM-DD
+        expiry_match = re.search(r'(\d{4}-\d{2}-\d{2})', symbol)
+        expiry = expiry_match.group(1) if expiry_match else None
+
+        # Look for DD-MMM (e.g. 17 NOV, 23 NOV, 17-NOV)
+        if not expiry:
+            exp_text_match = re.search(r'(\d{1,2})\s*[-_ ]?\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)', symbol, re.I)
+            if exp_text_match:
+                day = exp_text_match.group(1).zfill(2)
+                month = exp_text_match.group(2).upper()
+                expiry = f"{day}-{month}"
+
+        # Look for strike & type
         m = re.search(r'(\d{5})\s*(CE|PE|CALL|PUT)', symbol, re.I)
         if m:
             strike = m.group(1)
             t = m.group(2).upper()
             opt_type = 'CE' if ('CE' in t or 'CALL' in t) else 'PE'
-            return True, strike, opt_type
+            return True, strike, opt_type, expiry
+
         m2 = re.search(r'(CE|PE|CALL|PUT)\s*(\d{5})', symbol, re.I)
         if m2:
             t = m2.group(1).upper()
             strike = m2.group(2)
             opt_type = 'CE' if ('CE' in t or 'CALL' in t) else 'PE'
-            return True, strike, opt_type
-        return False, None, None
+            return True, strike, opt_type, expiry
 
-    async def change_symbol(self, symbol: str, tab_index: Optional[int] = None, target_tab: Optional[str] = None) -> Dict[str, Any]:
-        """Switches the chart symbol in the specified GoCharting tab (defaults to target_tab='OPTION' if multiple tabs exist).
-        Supports fully automated strike selection from the GoCharting NIFTY OPTIONS Chain modal."""
-        is_opt, strike, opt_type = self.parse_option_symbol(symbol)
+        return False, None, None, None
+
+    async def change_symbol(
+        self,
+        symbol: str,
+        expiry: Optional[str] = None,
+        tab_index: Optional[int] = None,
+        target_tab: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Switches the chart symbol and optional expiry in the specified GoCharting tab (defaults to target_tab='OPTION' if multiple tabs exist).
+        Supports fully automated strike and expiry selection from the GoCharting NIFTY OPTIONS Chain modal."""
+        is_opt, strike, opt_type, parsed_expiry = self.parse_option_symbol(symbol)
+        final_expiry = expiry or parsed_expiry
+
         if target_tab is None and is_opt:
             target_tab = "OPTION"
-            
+
         idx = self.find_tab_by_target(target=target_tab, tab_index=tab_index)
-        
+
         if is_opt and strike and opt_type:
             is_call_js = "true" if opt_type == "CE" else "false"
+            expiry_js = f'"{final_expiry}"' if final_expiry else "null"
             js = f"""
             (async () => {{
                 const strike = "{strike}";
                 const isCall = {is_call_js};
-                const colClass = isCall ? '.call' : '.put';
+                const targetExpiry = {expiry_js};
 
-                const isChainOpen = () => Array.from(document.querySelectorAll('*')).some(el =>
-                    (el.textContent || '').includes('OPTIONS Chain') && el.children.length < 5
-                );
-
-                const selectStrikeFromChain = () => {{
-                    const cells = Array.from(document.querySelectorAll(colClass));
-                    const match = cells.find(el => (el.textContent || '').includes(strike));
-                    if (match) {{
-                        const clickTarget = match.querySelector('span') || match;
-                        clickTarget.scrollIntoView({{ block: 'center', inline: 'center' }});
-                        clickTarget.click();
-                        return true;
-                    }}
-                    return false;
+                const isChainModalOpen = () => {{
+                    const header = document.querySelector('.call-header');
+                    return !!header && header.offsetParent !== null;
                 }};
 
-                // 1. If Options Chain modal is already visible, select directly!
-                if (isChainOpen()) {{
-                    if (selectStrikeFromChain()) {{
-                        await new Promise(r => setTimeout(r, 600));
-                        return {{ status: "ok", method: "direct_modal", symbol: "{symbol}", strike: strike, type: isCall ? "CE" : "PE", tab_index: {idx} }};
+                // 1. Open Options Chain modal if not open
+                if (!isChainModalOpen()) {{
+                    let searchDialog = document.querySelector('[class*="erbwhql110"]');
+                    if (!searchDialog || searchDialog.clientHeight < 100) {{
+                        const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
+                                          document.querySelector('.ohlc-symbol-button') ||
+                                          document.querySelector('.css-1gi9g8n');
+                        if (searchBtn) {{
+                            searchBtn.click();
+                            await new Promise(r => setTimeout(r, 600));
+                        }}
+                    }}
+
+                    const optTab = Array.from(document.querySelectorAll('button')).find(b => 
+                        (b.textContent || '').trim() === 'Options'
+                    );
+                    if (optTab) {{
+                        optTab.click();
+                        await new Promise(r => setTimeout(r, 400));
+                    }}
+
+                    const optRow = Array.from(document.querySelectorAll('[class*="erbwhql46"], [class*="erbwhql38"]')).find(el => 
+                        (el.textContent || '').includes('NIFTY OPTIONS')
+                    );
+                    if (optRow) {{
+                        optRow.click();
+                        for (let i = 0; i < 20; i++) {{
+                            await new Promise(r => setTimeout(r, 200));
+                            if (isChainModalOpen()) break;
+                        }}
                     }}
                 }}
 
-                // 2. If search dialog not open, open it
-                const isSearchOpen = () => {{
-                    const d = document.querySelector('[class*="erbwhql110"]');
-                    return d && d.clientHeight > 100;
+                if (!isChainModalOpen()) {{
+                    return {{ status: 'failed', message: 'Could not open Options Chain modal', tab_index: {idx} }};
+                }}
+
+                // 2. Select Expiry if specified
+                if (targetExpiry) {{
+                    const expiryBtns = Array.from(document.querySelectorAll('button')).filter(b => 
+                        /\\d{{4}}-\\d{{2}}-\\d{{2}}/.test((b.textContent || '').trim())
+                    );
+                    const expMatch = expiryBtns.find(b => {{
+                        const t = b.textContent.trim().toUpperCase();
+                        const req = targetExpiry.toUpperCase();
+                        if (t === req || req.includes(t) || t.includes(req)) return true;
+                        if (req.includes("17") && t.endsWith("-17")) return true;
+                        if (req.includes("23") && t.endsWith("-23")) return true;
+                        if (req.includes("01") && (t.endsWith("-01") || t.endsWith("-1"))) return true;
+                        if (req.includes("08") && (t.endsWith("-08") || t.endsWith("-8"))) return true;
+                        if (req.includes("29") && t.endsWith("-29")) return true;
+                        return false;
+                    }});
+                    if (expMatch) {{
+                        expMatch.click();
+                        await new Promise(r => setTimeout(r, 800));
+                    }}
+                }}
+
+                // 3. Find target strike row in table
+                const rows = Array.from(document.querySelectorAll('tr'));
+                const targetRow = rows.find(r => {{
+                    const sCell = r.querySelector('.strike');
+                    return sCell && sCell.textContent.trim() === strike;
+                }});
+
+                if (!targetRow) {{
+                    return {{ status: 'failed', message: 'Strike ' + strike + ' not found in options chain table', totalRows: rows.length, tab_index: {idx} }};
+                }}
+
+                const targetCell = isCall ? targetRow.querySelector('.call') : targetRow.querySelector('.put');
+                if (!targetCell) {{
+                    return {{ status: 'failed', message: 'Column cell not found for strike ' + strike, tab_index: {idx} }};
+                }}
+
+                const clickTarget = targetCell.querySelector('span') || targetCell;
+                clickTarget.scrollIntoView({{ block: 'center', inline: 'center' }});
+                clickTarget.click();
+                await new Promise(r => setTimeout(r, 600));
+
+                const closeBtn = document.querySelector('.css-1mft2lf');
+                if (closeBtn) closeBtn.click();
+
+                return {{
+                    status: 'ok',
+                    method: 'options_chain_selection',
+                    symbol: '{symbol}',
+                    strike: strike,
+                    type: isCall ? 'CE' : 'PE',
+                    expiry: targetExpiry || 'current',
+                    selectedContract: clickTarget.textContent.trim(),
+                    tab_index: {idx}
                 }};
-
-                if (!isSearchOpen()) {{
-                    const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
-                                      document.querySelector('.ohlc-symbol-button') ||
-                                      document.querySelector('.css-1gi9g8n');
-                    if (searchBtn) {{
-                        searchBtn.click();
-                        await new Promise(r => setTimeout(r, 600));
-                    }}
-                }}
-
-                // 3. Click 'Options' filter tab
-                const optTab = Array.from(document.querySelectorAll('button')).find(b => 
-                    (b.textContent || '').trim() === 'Options'
-                );
-                if (optTab) {{
-                    optTab.click();
-                    await new Promise(r => setTimeout(r, 400));
-                }}
-
-                // 4. Click 'NIFTY OPTIONS' leaf row to open Chain modal
-                const optItem = Array.from(document.querySelectorAll('div, span')).find(el => 
-                    el.children.length === 0 && (el.textContent || '').trim() === 'NIFTY OPTIONS'
-                );
-                if (optItem) {{
-                    optItem.click();
-                    await new Promise(r => setTimeout(r, 700));
-                }}
-
-                // 5. Select the strike from the opened chain
-                if (selectStrikeFromChain()) {{
-                    await new Promise(r => setTimeout(r, 600));
-                    return {{ status: "ok", method: "opened_chain_and_selected", symbol: "{symbol}", strike: strike, type: isCall ? "CE" : "PE", tab_index: {idx} }};
-                }}
-
-                return {{ status: "failed", message: "Strike " + strike + " not found in options chain", tab_index: {idx} }};
             }})()
             """
         else:

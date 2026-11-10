@@ -269,14 +269,14 @@ async def run_tests():
         print(f"   ❌ FAIL: {e}")
 
     # ---------------------------------------------------------
-    # Test 12: Automated Option Strike Switching via Options Chain
+    # Test 12: Automated Strike & Expiry Selection via Options Chain
     # ---------------------------------------------------------
     total += 1
-    print("\n[Test 12] Testing Automated Option Strike Switching via Options Chain...")
+    print("\n[Test 12] Testing Automated Strike & Expiry Selection via Options Chain...")
     try:
-        switch_res = await controller.change_symbol("25000 PE", target_tab="OPTION")
+        switch_res = await controller.change_symbol("25000 PE", expiry="2026-11-17", target_tab="OPTION")
         if switch_res.get("status") == "ok":
-            print(f"   ✅ PASS: Seamlessly selected strike via {switch_res.get('method')}: {switch_res.get('symbol')} (strike {switch_res.get('strike')})")
+            print(f"   ✅ PASS: Seamlessly selected contract: {switch_res.get('selectedContract')} (expiry: {switch_res.get('expiry')})")
             passed += 1
         else:
             print(f"   ❌ FAIL: change_symbol returned: {switch_res}")
