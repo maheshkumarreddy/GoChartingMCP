@@ -1,10 +1,11 @@
-# Python virtual environments
+# Python virtual environments & symlinks
+.venv
 .venv/
 venv/
 ENV/
 env/
 
-# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized
 __pycache__/
 *.py[cod]
 *$py.class
@@ -12,7 +13,14 @@ __pycache__/
 # Chrome profile (contains user credentials, local cache)
 bot_chrome_profile/
 
-# Screenshots and test output images
+# Binary tools & local tunnel scripts
+bin/
+launch_tunnel.sh
+start_tunnel.sh
+test_client.py
+browser_hook.js
+
+# Screenshots, test images, logs
 *.png
 *.jpg
 *.jpeg

@@ -26,3 +26,4 @@ sleep 1
 nohup "$DIR/.venv/bin/python3" "$DIR/server.py" > "$DIR/server.log" 2>&1 &
 
 echo "✅ Update complete! Server running on port 8765."
+
