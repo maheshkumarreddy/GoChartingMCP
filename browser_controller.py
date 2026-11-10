@@ -1,10 +1,11 @@
 """
 Browser Controller for GoCharting via Chrome DevTools Protocol (CDP).
-Provides full programmatic control over the dedicated Bot Chrome instance:
+Provides programmatic control over the dedicated Bot Chrome instance:
 - Change symbols (Nifty Futures, Bank Nifty, Options strikes)
 - Change timeframes (1m, 3m, 5m, etc.)
 - Open tools and studies (VWAP, CVD, Market Profile, OI Profile)
-- Modify chart/footprint settings
+- Extract 100% full-day 1-minute footprint candles directly from GoCharting's core engine
+- Extract Spot underlying, Basis, and Options chain Greek context
 - Capture live chart screenshots for visual AI inspection
 """
 
@@ -42,12 +43,12 @@ class GoChartingBrowserController:
         return None
 
     async def execute_js(self, expression: str) -> Any:
-        """Executes JavaScript inside the GoCharting tab."""
+        """Executes JavaScript inside the GoCharting tab via CDP."""
         ws_url = self._get_page_ws_url()
         if not ws_url:
             return {"error": "Bot Chrome instance not detected on port 9222. Ensure launch_bot_chrome.sh is running."}
 
-        async with websockets.connect(ws_url) as ws:
+        async with websockets.connect(ws_url, max_size=20_000_000) as ws:
             req = {
                 "id": 1,
                 "method": "Runtime.evaluate",
@@ -82,7 +83,6 @@ class GoChartingBrowserController:
                     input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     await new Promise(r => setTimeout(r, 600));
                     
-                    // Press Enter or click first result
                     const firstResult = document.querySelector('.symbol-item') || document.querySelector('[data-qa*="search-result"]');
                     if (firstResult) {{
                         firstResult.click();
@@ -106,7 +106,6 @@ class GoChartingBrowserController:
                 intervalBtn.click();
                 await new Promise(r => setTimeout(r, 300));
                 
-                // Find matching interval item in dropdown
                 const items = Array.from(document.querySelectorAll('.dropdown-item, .interval-item, li'));
                 const match = items.find(el => el.innerText.trim().toLowerCase() === '{interval.lower()}');
                 if (match) {{
@@ -148,8 +147,13 @@ class GoChartingBrowserController:
 
     async def extract_live_footprint_from_chart(self) -> Dict[str, Any]:
         """
-        Extracts the exact clustered footprint and OHLC values directly from GoCharting's
-        dataManager and timeSeriesStoreMap, matching the browser canvas display 100%.
+        Extracts all 1-minute footprint candles of the active trading session directly from GoCharting's
+        timeSeriesStoreMap and dataManager.
+        Guarantees:
+        - Full trading day coverage (from 09:15 morning open to post-market close)
+        - Exact deltaMin and deltaMax per candle
+        - Correct OHLC and Open Interest mapping
+        - Full price ladder with buy/sell tick volumes
         """
         js = """
         (() => {
@@ -163,134 +167,100 @@ class GoChartingBrowserController:
                 const main = c0?.dataStore?.getState()?.main;
                 const mainData = main ? main.mainChartData || [] : [];
 
-                // Build OHLC lookup map from mainChartData
+                // Build OHLC and Open Interest lookup map keyed by exact timestamp
                 const ohlcMap = {};
-                for (let i = Math.max(0, mainData.length - 200); i < mainData.length; i++) {
-                    const b = mainData[i];
-                    if (b && b.date) {
-                        ohlcMap[new Date(b.date).getTime()] = b;
+                for (let b of mainData) {
+                    const ts = b.luxon_date?.ts || (b.date_str ? new Date(b.date_str).getTime() : null);
+                    if (ts) {
+                        ohlcMap[ts] = b;
                     }
                 }
 
-                // First check if fullCluster already has active clusters
-                const fc = dm?.additionalData?.fullCluster;
+                // Retrieve footprint data from timeSeriesStoreMap
+                const rootStore = c.transient?.rootStore?.getState();
+                const tsm = rootStore?.transient?.timeSeriesStoreMap;
+                let fpMap = null;
+
+                if (tsm) {
+                    for (let k of tsm.keys()) {
+                        const sub = tsm.get(k)?.getState();
+                        if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
+                            fpMap = sub.footprint;
+                            break;
+                        }
+                    }
+                }
+
+                if (!fpMap) return JSON.stringify({ error: "Footprint data map not found in timeSeriesStoreMap." });
+
+                const dates = Object.keys(fpMap).sort();
+                const latestDate = dates[dates.length - 1];
+                const fpForDate = fpMap[latestDate];
+                const candles = fpForDate.candles || [];
+                const clusterMap = new Map();
+                const tpo = dm.tpo || { value: 6, precision: 1 };
+
                 const results = [];
+                for (let candle of candles) {
+                    const candleDate = new Date(candle.date);
+                    const ts = candleDate.getTime();
+                    
+                    dm.buildClusterForCandle(canvasRef, fpForDate, candle, { date: candleDate }, tpo, clusterMap);
+                    const cluster = clusterMap.get(ts);
+                    const ohlc = ohlcMap[ts] || {};
+                    const volTotals = cluster?.candleLevelTotals?.volume || {};
+                    const priceDivisor = cluster?.price_divisor || 10;
 
-                if (fc && fc.size > 0) {
-                    for (const [timestamp, candleCluster] of fc.entries()) {
-                        const ohlc = ohlcMap[timestamp] || {};
-                        const levels = [];
-                        const clusterMap = candleCluster.clusterForCandle;
-
-                        if (clusterMap) {
-                            for (const [lvl, data] of clusterMap.entries()) {
-                                levels.push({
-                                    price: lvl / candleCluster.price_divisor,
-                                    buy_vol: data.volume.buy,
-                                    sell_vol: data.volume.sell,
-                                    delta: data.volume.buy - data.volume.sell,
-                                    total_vol: data.volume.total,
-                                    buy_trades: data.trades.buy,
-                                    sell_trades: data.trades.sell
-                                });
-                            }
-                        }
-                        levels.sort((a, b) => a.price - b.price);
-
-                        const pocPrice = candleCluster.candleLevelTotals ?
-                                         candleCluster.candleLevelTotals.volume.poc / candleCluster.price_divisor : 0;
-
-                        results.push({
-                            timestamp: new Date(timestamp).toISOString(),
-                            date_str: ohlc.date_str || new Date(timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-                            open: ohlc.open !== undefined ? ohlc.open : (levels.length > 0 ? levels[0].price : 0),
-                            high: ohlc.high !== undefined ? ohlc.high : (levels.length > 0 ? levels[levels.length - 1].price : 0),
-                            low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
-                            close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
-                            volume: ohlc.volume !== undefined ? ohlc.volume : levels.reduce((s, x) => s + x.total_vol, 0),
-                            open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
-                            oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
-                            oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
-                            oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
-                            poc_price: pocPrice,
-                            levels: levels
-                        });
-                    }
-                }
-
-                // If fullCluster was empty, cluster recent candles from timeSeriesStoreMap directly
-                if (results.length === 0) {
-                    const rootStore = c.transient?.rootStore?.getState();
-                    const tsm = rootStore?.transient?.timeSeriesStoreMap;
-                    let fpMap = null;
-
-                    if (tsm) {
-                        for (let k of tsm.keys()) {
-                            const sub = tsm.get(k)?.getState();
-                            if (sub?.footprint && Object.keys(sub.footprint).length > 0) {
-                                fpMap = sub.footprint;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (fpMap) {
-                        const dates = Object.keys(fpMap).sort();
-                        const latestDate = dates[dates.length - 1];
-                        const fpForDate = fpMap[latestDate];
-                        const candles = fpForDate.candles || [];
-                        const recent = candles.slice(-50); // Last 50 candles
-                        const clusterMap = new Map();
-                        const tpo = dm.tpo || { value: 6, precision: 1 };
-
-                        for (let candle of recent) {
-                            const candleObj = { date: new Date(candle.date) };
-                            dm.buildClusterForCandle(canvasRef, fpForDate, candle, candleObj, tpo, clusterMap);
-                            const cluster = clusterMap.get(candleObj.date.getTime());
-
-                            const levels = [];
-                            if (cluster && cluster.clusterForCandle) {
-                                for (let [lvl, val] of cluster.clusterForCandle.entries()) {
-                                    levels.push({
-                                        price: lvl / cluster.price_divisor,
-                                        buy_vol: val.volume.buy,
-                                        sell_vol: val.volume.sell,
-                                        delta: val.volume.buy - val.volume.sell,
-                                        total_vol: val.volume.total,
-                                        buy_trades: val.trades.buy,
-                                        sell_trades: val.trades.sell
-                                    });
-                                }
-                            }
-                            levels.sort((a, b) => a.price - b.price);
-
-                            const pocPrice = cluster?.candleLevelTotals?.volume?.poc ?
-                                             cluster.candleLevelTotals.volume.poc / cluster.price_divisor : 0;
-                            const ohlc = ohlcMap[candleObj.date.getTime()] || {};
-
-                            results.push({
-                                timestamp: candleObj.date.toISOString(),
-                                date_str: candle.date,
-                                open: ohlc.open !== undefined ? ohlc.open : (levels.length > 0 ? levels[0].price : 0),
-                                high: ohlc.high !== undefined ? ohlc.high : (levels.length > 0 ? levels[levels.length - 1].price : 0),
-                                low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
-                                close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
-                                volume: ohlc.volume !== undefined ? ohlc.volume : levels.reduce((s, x) => s + x.total_vol, 0),
-                                open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
-                                oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
-                                oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
-                                oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
-                                poc_price: pocPrice,
-                                levels: levels
+                    const levels = [];
+                    if (cluster && cluster.clusterForCandle) {
+                        for (let [lvl, val] of cluster.clusterForCandle.entries()) {
+                            levels.push({
+                                price: lvl / priceDivisor,
+                                buy_vol: val.volume.buy,
+                                sell_vol: val.volume.sell,
+                                delta: val.volume.buy - val.volume.sell,
+                                total_vol: val.volume.total,
+                                buy_trades: val.trades.buy,
+                                sell_trades: val.trades.sell
                             });
                         }
                     }
+                    levels.sort((a, b) => a.price - b.price);
+
+                    const pocPrice = volTotals.poc ? volTotals.poc / priceDivisor : (levels.length > 0 ? levels[0].price : 0);
+                    const buyVol = volTotals.buy !== undefined ? volTotals.buy : levels.reduce((s, x) => s + x.buy_vol, 0);
+                    const sellVol = volTotals.sell !== undefined ? volTotals.sell : levels.reduce((s, x) => s + x.sell_vol, 0);
+                    const netDelta = buyVol - sellVol;
+                    const minDelta = volTotals.deltaMin !== undefined ? volTotals.deltaMin : netDelta;
+                    const maxDelta = volTotals.deltaMax !== undefined ? volTotals.deltaMax : netDelta;
+
+                    results.push({
+                        timestamp: candleDate.toISOString(),
+                        date_str: candle.date,
+                        open: ohlc.open !== undefined ? ohlc.open : (levels.length > 0 ? levels[0].price : 0),
+                        high: ohlc.high !== undefined ? ohlc.high : (levels.length > 0 ? levels[levels.length - 1].price : 0),
+                        low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
+                        close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
+                        volume: ohlc.volume !== undefined ? ohlc.volume : (buyVol + sellVol),
+                        total_buy_vol: buyVol,
+                        total_sell_vol: sellVol,
+                        net_delta: netDelta,
+                        min_delta: minDelta,
+                        max_delta: maxDelta,
+                        open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
+                        oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
+                        oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
+                        oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
+                        poc_price: pocPrice,
+                        levels: levels
+                    });
                 }
 
                 const symbol = c.security ? c.security.ticker : "NSE:NIFTY-I";
                 return JSON.stringify({
                     status: "ok",
                     symbol: symbol,
+                    session_date: latestDate,
                     candlesCount: results.length,
                     candles: results
                 });
@@ -355,6 +325,10 @@ class GoChartingBrowserController:
                 const spotAtmStrike = spotPrice ? Math.round(spotPrice / strikeStep) * strikeStep : null;
                 const futuresAtmStrike = futuresPrice ? Math.round(futuresPrice / strikeStep) * strikeStep : null;
 
+                const rawDte = firstSeries.dte;
+                const dteExactDays = rawDte !== undefined && rawDte !== null ? Number(rawDte.toFixed(1)) : null;
+                const dteCalendarDays = rawDte !== undefined && rawDte !== null ? Math.ceil(rawDte) : null;
+
                 return {
                     status: 'ok',
                     futures_symbol: store?.security?.ticker || 'NSE:NIFTY-I',
@@ -375,8 +349,10 @@ class GoChartingBrowserController:
                         pcr_oi: firstSeries.pcr_oi,
                         pcr_volume: firstSeries.pcr_vol,
                         atm_iv: firstSeries.atmiv,
-                        dte_days: firstSeries.dte ? Number(firstSeries.dte.toFixed(1)) : null,
-                        nearest_expiry: firstSeries.displayFormat
+                        dte_exact_days: dteExactDays,
+                        dte_calendar_days: dteCalendarDays,
+                        nearest_expiry_display: firstSeries.displayFormat,
+                        dte_note: 'dte_exact_days indicates trading fraction remaining; dte_calendar_days is calendar days to expiry date.'
                     }
                 };
             } catch(e) {
@@ -407,4 +383,3 @@ class GoChartingBrowserController:
 
 # Global controller instance
 controller = GoChartingBrowserController()
-

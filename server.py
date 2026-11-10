@@ -3,7 +3,7 @@ GoCharting Order Flow MCP Server
 Exposes 1-minute candle Footprint, Tick Delta ladders, and Order Flow signals
 via Model Context Protocol (MCP) with:
   - Streamable HTTP at /mcp  (Antigravity / modern clients)
-  - Legacy SSE at /sse        (Claude Desktop / older clients)
+  - Legacy SSE at /sse        (Claude Desktop, Muse AI, & legacy clients)
 """
 
 import os
@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
-from orderflow_store import store
+from orderflow_store import store, get_market_session_info
 from browser_controller import controller
 
 # Initialize MCP Server
@@ -36,7 +36,7 @@ async def auto_sync_if_needed():
 
 
 # ==========================================
-# BROWSER AUTOMATION TOOLS (FULL CONTROL)
+# BROWSER AUTOMATION TOOLS (SAFE ACTIONS)
 # ==========================================
 
 @mcp.tool()
@@ -44,14 +44,21 @@ async def browser_sync_now() -> Dict[str, Any]:
     """
     Forces an immediate live sync of order flow footprint candles directly
     from the open GoCharting browser tab.
+    Returns synced symbols, candle counts, market session status, and data staleness indicators.
     """
     await auto_sync_if_needed()
     active = store.list_active_symbols()
+    session_info = get_market_session_info(active[0]["latest_time"] if active else None)
     return {
         "status": "ok",
         "synced_symbols": [s["symbol"] for s in active],
-        "active_charts": active
+        "active_charts": active,
+        "market_session_state": session_info["market_session_state"],
+        "is_live": session_info["is_live"],
+        "data_age_seconds": session_info["data_age_seconds"],
+        "staleness_warning": session_info["staleness_warning"]
     }
+
 
 @mcp.tool()
 async def browser_change_symbol(symbol: str) -> Dict[str, Any]:
@@ -81,16 +88,6 @@ async def browser_open_tool(tool_name: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def browser_execute_custom_js(javascript_code: str) -> Dict[str, Any]:
-    """
-    Executes custom JavaScript inside the GoCharting tab to modify any setting,
-    footprint cluster configuration, or UI state.
-    """
-    val = await controller.execute_js(javascript_code)
-    return {"status": "ok", "result": val}
-
-
-@mcp.tool()
 async def browser_capture_screenshot() -> Dict[str, Any]:
     """
     Captures a full high-resolution screenshot of the GoCharting chart window
@@ -108,7 +105,8 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
     """
     Get the latest 1-minute order flow candle for the specified symbol
     (e.g., 'NIFTY_FUT', 'BANKNIFTY_FUT', or an option strike).
-    Returns OHLCV, Net Delta, Min/Max Delta, POC price, CVD, and instant signals.
+    Returns OHLCV, Net Delta, intra-candle Min/Max Delta, POC price, CVD,
+    Open Interest changes, Institutional Positioning Quadrant, and market session state.
     """
     await auto_sync_if_needed()
     candle = store.get_latest_candle(symbol)
@@ -119,6 +117,8 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
             "tip": "Ensure GoCharting has the chart open with the browser hook enabled, or call switch_chart."
         }
 
+    session_info = get_market_session_info(candle.timestamp)
+
     return {
         "symbol": candle.symbol,
         "timeframe": candle.timeframe,
@@ -127,6 +127,8 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
         "high": candle.high_price,
         "low": candle.low_price,
         "close": candle.close_price,
+        "prev_close": candle.prev_close_price,
+        "price_change": candle.price_change,
         "volume": candle.total_volume,
         "buy_volume": candle.total_buy_vol,
         "sell_volume": candle.total_sell_vol,
@@ -139,7 +141,14 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
         "positioning_quadrant": candle.positioning_quadrant,
         "poc_price": candle.poc_price,
         "cvd": candle.cvd,
-        "signals": candle.signals
+        "is_post_close": candle.is_post_close,
+        "post_close_note": "Post-market settlement/auction trade (15:31-15:40 IST), not active continuous trading." if candle.is_post_close else None,
+        "signals": candle.signals,
+        "market_session_state": session_info["market_session_state"],
+        "is_live": session_info["is_live"],
+        "data_age_seconds": session_info["data_age_seconds"],
+        "current_time_ist": session_info["current_time_ist"],
+        "staleness_warning": session_info["staleness_warning"]
     }
 
 
@@ -150,6 +159,9 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
     Each price level lists the net delta (Buy Vol - Sell Vol), total volume, and flags for POC and imbalances.
     candle_index=0 is the current/latest candle; 1 is the previous closed candle.
     """
+    if candle_index < 0:
+        return {"error": f"Invalid candle_index '{candle_index}'. Must be an integer >= 0."}
+
     await auto_sync_if_needed()
     history = store.get_history(symbol, limit=candle_index + 1)
     if not history or len(history) <= candle_index:
@@ -157,17 +169,21 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
 
     candle = history[candle_index]
     
-    # Format tick deltas compactly for LLM efficiency
     ladder = []
     for lvl in candle.tick_deltas:
         ladder.append({
             "price": lvl.price,
             "delta": lvl.delta,
+            "buy_vol": lvl.buy_vol,
+            "sell_vol": lvl.sell_vol,
             "vol": lvl.volume,
+            "trades": lvl.trades,
             "is_poc": lvl.is_poc,
             "buy_imbalance": lvl.is_buy_imbalance,
             "sell_imbalance": lvl.is_sell_imbalance
         })
+
+    session_info = get_market_session_info(candle.timestamp)
 
     return {
         "symbol": candle.symbol,
@@ -175,10 +191,15 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
         "timestamp": candle.timestamp,
         "close": candle.close_price,
         "net_candle_delta": candle.net_delta,
+        "min_delta": candle.min_delta,
+        "max_delta": candle.max_delta,
         "cvd": candle.cvd,
         "poc_price": candle.poc_price,
         "tick_count": len(ladder),
-        "tick_delta_ladder": ladder
+        "tick_delta_ladder": ladder,
+        "market_session_state": session_info["market_session_state"],
+        "is_live": session_info["is_live"],
+        "data_age_seconds": session_info["data_age_seconds"]
     }
 
 
@@ -189,10 +210,19 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
     Detects Cumulative Volume Delta (CVD) divergence, aggressive absorption,
     and stacked buy/sell imbalances.
     """
+    if lookback <= 0:
+        return {
+            "error": f"Invalid lookback value '{lookback}'. Lookback must be a positive integer >= 1.",
+            "requested_lookback": lookback
+        }
+
     await auto_sync_if_needed()
-    candles = store.get_history(symbol, limit=lookback)
-    if not candles:
+    all_candles = store.candles.get(symbol, [])
+    if not all_candles:
         return {"error": f"No history found for {symbol}."}
+
+    candles = all_candles[:lookback]
+    is_clamped = len(all_candles) < lookback
 
     recent_signals = []
     total_delta = 0
@@ -202,7 +232,10 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
         recent_signals.append({
             "timestamp": c.timestamp,
             "close": c.close_price,
+            "price_change": c.price_change,
             "delta": c.net_delta,
+            "min_delta": c.min_delta,
+            "max_delta": c.max_delta,
             "poc": c.poc_price,
             "absorption_low": c.signals.get("absorption_at_low", False),
             "absorption_high": c.signals.get("absorption_at_high", False),
@@ -213,7 +246,7 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
 
     latest = candles[0]
     first = candles[-1]
-    price_change = latest.close_price - first.close_price
+    price_change = round(latest.close_price - first.prev_close_price, 2)
 
     # Market state interpretation
     bias = "NEUTRAL"
@@ -226,13 +259,22 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
     elif total_delta > 0 and price_change < 0:
         bias = "BULLISH_DIVERGENCE (Price falling on positive delta; sellers absorbed)"
 
+    session_info = get_market_session_info(latest.timestamp)
+
     return {
         "symbol": symbol,
+        "requested_lookback": lookback,
         "candles_analyzed": len(candles),
+        "is_clamped": is_clamped,
         "bias": bias,
         "net_lookback_delta": total_delta,
+        "lookback_price_change": price_change,
         "current_cvd": latest.cvd,
-        "candle_breakdowns": recent_signals
+        "candle_breakdowns": recent_signals,
+        "market_session_state": session_info["market_session_state"],
+        "is_live": session_info["is_live"],
+        "data_age_seconds": session_info["data_age_seconds"],
+        "staleness_warning": session_info["staleness_warning"]
     }
 
 
@@ -240,12 +282,22 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
 async def get_oi_analysis(symbol: str = "NIFTY_FUT", lookback: int = 10) -> Dict[str, Any]:
     """
     Analyzes 1-minute Open Interest (OI) changes alongside Net Delta to categorize
-    institutional positioning into 4 Quadrants:
+    institutional positioning into canonical quadrants:
     - LONG_BUILDUP: Price UP + OI UP + Buy Delta (Fresh aggressive buying)
-    - SHORT_COVERING: Price UP + OI DOWN + Buy Delta (Bears forced to buy/liquidate; weak rally)
+    - SHORT_COVERING: Price UP + OI DOWN + Buy Delta (Bears forced to buy/liquidate; short squeeze)
     - SHORT_BUILDUP: Price DOWN + OI UP + Sell Delta (Fresh aggressive selling)
-    - LONG_UNWINDING: Price DOWN + OI DOWN + Sell Delta (Bulls liquidating/stop loss cascade)
+    - LONG_UNWINDING: Price DOWN + OI DOWN + Sell Delta (Bulls liquidating / stop-loss cascade)
+    - ABSORPTION_BUY: Price UP + OI UP + Sell Delta (Passive buyers absorbing aggressive selling)
+    - ABSORPTION_SELL: Price DOWN + OI UP + Buy Delta (Passive sellers absorbing aggressive buying)
+    - SHORT_COVERING_DIV / LONG_UNWINDING_DIV: Passive covering/unwinding divergences
+    - NEUTRAL_OI: OI change is 0
     """
+    if lookback <= 0:
+        return {
+            "error": f"Invalid lookback value '{lookback}'. Lookback must be a positive integer >= 1.",
+            "requested_lookback": lookback
+        }
+
     await auto_sync_if_needed()
     return store.get_oi_analysis(symbol, lookback)
 
@@ -256,7 +308,7 @@ async def get_basis_analysis(symbol: str = "NIFTY") -> Dict[str, Any]:
     Calculates Basis (Futures Price - Spot Index Price) in real time.
     Reveals whether Futures are leading or following Spot, determines Premium vs Discount,
     and provides Spot-anchored ATM strike guidance for accurate option pricing.
-    Also returns Max Pain, Put-Call Ratio (PCR), and ATM Implied Volatility (IV).
+    Also returns Max Pain, Put-Call Ratio (PCR), ATM Implied Volatility (IV), and exact DTE.
     """
     return await controller.extract_spot_and_options_context(symbol)
 
@@ -279,7 +331,7 @@ def switch_chart(symbol: str, segment: str = "FUT", timeframe: str = "1m") -> Di
 def list_active_charts() -> Dict[str, Any]:
     """
     Lists all symbols currently streaming and cached in local memory,
-    with their latest price, delta, CVD, and candle counts.
+    with their latest price, delta, CVD, candle counts, and market session state.
     """
     active = store.list_active_symbols()
     return {
@@ -356,10 +408,7 @@ async def get_status(request: Request):
 # BUILD SSE APP
 # ==========================================
 
-# Use the official MCP SSE Starlette app directly so that the SSE event stream,
-# session manager, endpoint event, and /messages/ endpoints operate with 100%
-# specification compliance. host="0.0.0.0" disables localhost DNS rebinding
-# checks so Cloudflare Tunnels (and Muse AI) connect without friction.
+# Official MCP SSE Starlette app with 0.0.0.0 host binding
 app = mcp.sse_app(host="0.0.0.0")
 
 # Allow CORS so browser extension / remote clients can communicate seamlessly
