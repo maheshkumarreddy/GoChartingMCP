@@ -208,6 +208,10 @@ class GoChartingBrowserController:
                             low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
                             close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
                             volume: ohlc.volume !== undefined ? ohlc.volume : levels.reduce((s, x) => s + x.total_vol, 0),
+                            open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
+                            oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
+                            oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
+                            oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
                             poc_price: pocPrice,
                             levels: levels
                         });
@@ -272,6 +276,10 @@ class GoChartingBrowserController:
                                 low: ohlc.low !== undefined ? ohlc.low : (levels.length > 0 ? levels[0].price : 0),
                                 close: ohlc.close !== undefined ? ohlc.close : (levels.length > 0 ? levels[levels.length - 1].price : 0),
                                 volume: ohlc.volume !== undefined ? ohlc.volume : levels.reduce((s, x) => s + x.total_vol, 0),
+                                open_interest: ohlc.open_interest !== undefined ? ohlc.open_interest : 0,
+                                oi_change: ohlc.oiChange !== undefined ? ohlc.oiChange : 0,
+                                oi_day_change: ohlc.oiDayChange !== undefined ? ohlc.oiDayChange : 0,
+                                oi_day_percent: ohlc.oiDayPercent !== undefined ? ohlc.oiDayPercent : 0,
                                 poc_price: pocPrice,
                                 levels: levels
                             });
@@ -299,7 +307,87 @@ class GoChartingBrowserController:
                 return {"raw": res_str}
         return res_str or {}
 
-    async def capture_screenshot(self, output_path: str = "/Users/mac/Desktop/GoChartingMCP/chart_screenshot.png") -> Dict[str, Any]:
+    async def extract_spot_and_options_context(self, symbol: str = "NIFTY") -> Dict[str, Any]:
+        """
+        Extracts real-time Spot underlying price, Basis (Futures - Spot), Max Pain,
+        PCR (Put-Call Ratio), and ATM IV from GoCharting's underlyingStoreMap.
+        """
+        js = """
+        (() => {
+            try {
+                const c0 = window.rootReduxStore?.getState()?.chartComponentList?.[0];
+                const store = c0?.store?.getState();
+                const rootStore = store?.transient?.rootStore?.getState();
+                const usm = rootStore?.transient?.underlyingStoreMap;
+
+                let foundKey = null;
+                if (usm) {
+                    for (let k of usm.keys()) {
+                        if (k.includes('NIFTY') || k.includes('SPOT')) {
+                            foundKey = k;
+                            break;
+                        }
+                    }
+                }
+                if (!foundKey) return { error: 'No underlying spot data currently loaded in GoCharting.' };
+
+                const sub = usm.get(foundKey);
+                const state = sub?.getState ? sub.getState() : sub;
+                const oc = state?.options_chain;
+                const firstSeries = oc?.seriesData?.[0] || {};
+
+                // Current futures close price from main chart
+                const mainData = c0?.dataStore?.getState()?.main?.mainChartData;
+                const lastFutureBar = mainData ? mainData[mainData.length - 1] : null;
+                const futuresPrice = lastFutureBar ? lastFutureBar.close : null;
+                const spotPrice = firstSeries.underlying_price || null;
+                const basis = (futuresPrice !== null && spotPrice !== null) ? Number((futuresPrice - spotPrice).toFixed(2)) : null;
+                const basisPct = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 100).toFixed(4)) : null;
+
+                let basisState = 'PARITY';
+                if (basis !== null) {
+                    if (basis > 1.0) basisState = 'PREMIUM';
+                    else if (basis < -1.0) basisState = 'DISCOUNT';
+                }
+
+                // Calculate ATM strike anchored to Spot Price vs Futures Price
+                const strikeStep = 50;
+                const spotAtmStrike = spotPrice ? Math.round(spotPrice / strikeStep) * strikeStep : null;
+                const futuresAtmStrike = futuresPrice ? Math.round(futuresPrice / strikeStep) * strikeStep : null;
+
+                return {
+                    status: 'ok',
+                    futures_symbol: store?.security?.ticker || 'NSE:NIFTY-I',
+                    underlying_symbol: foundKey,
+                    futures_price: futuresPrice,
+                    spot_price: spotPrice,
+                    basis: basis,
+                    basis_percent: basisPct,
+                    basis_state: basisState,
+                    strike_guidance: {
+                        spot_atm_strike: spotAtmStrike,
+                        futures_atm_strike: futuresAtmStrike,
+                        strike_difference: (futuresAtmStrike && spotAtmStrike) ? futuresAtmStrike - spotAtmStrike : 0,
+                        note: 'Always anchor option strikes to spot_atm_strike for accurate Greeks and intrinsic value.'
+                    },
+                    options_context: {
+                        max_pain: firstSeries.maxPain,
+                        pcr_oi: firstSeries.pcr_oi,
+                        pcr_volume: firstSeries.pcr_vol,
+                        atm_iv: firstSeries.atmiv,
+                        dte_days: firstSeries.dte ? Number(firstSeries.dte.toFixed(1)) : null,
+                        nearest_expiry: firstSeries.displayFormat
+                    }
+                };
+            } catch(e) {
+                return { error: e.toString() };
+            }
+        })()
+        """
+        res = await self.execute_js(js)
+        return res if isinstance(res, dict) else {"error": str(res)}
+
+    async def capture_screenshot(self, output_path: str = "chart_screenshot.png") -> Dict[str, Any]:
         """Captures a full screenshot of the active GoCharting window."""
         ws_url = self._get_page_ws_url()
         if not ws_url:

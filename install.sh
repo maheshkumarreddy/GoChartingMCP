@@ -103,3 +103,4 @@ chmod +x "$DIR/test_suite.py"
 # 6. Start services
 echo "🚀 Launching all services..."
 "$DIR/start_all.sh"
+

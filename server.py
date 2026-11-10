@@ -133,6 +133,10 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
         "net_delta": candle.net_delta,
         "min_delta": candle.min_delta,
         "max_delta": candle.max_delta,
+        "open_interest": candle.open_interest,
+        "oi_change": candle.oi_change,
+        "oi_day_change": candle.oi_day_change,
+        "positioning_quadrant": candle.positioning_quadrant,
         "poc_price": candle.poc_price,
         "cvd": candle.cvd,
         "signals": candle.signals
@@ -230,6 +234,31 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5) ->
         "current_cvd": latest.cvd,
         "candle_breakdowns": recent_signals
     }
+
+
+@mcp.tool()
+async def get_oi_analysis(symbol: str = "NIFTY_FUT", lookback: int = 10) -> Dict[str, Any]:
+    """
+    Analyzes 1-minute Open Interest (OI) changes alongside Net Delta to categorize
+    institutional positioning into 4 Quadrants:
+    - LONG_BUILDUP: Price UP + OI UP + Buy Delta (Fresh aggressive buying)
+    - SHORT_COVERING: Price UP + OI DOWN + Buy Delta (Bears forced to buy/liquidate; weak rally)
+    - SHORT_BUILDUP: Price DOWN + OI UP + Sell Delta (Fresh aggressive selling)
+    - LONG_UNWINDING: Price DOWN + OI DOWN + Sell Delta (Bulls liquidating/stop loss cascade)
+    """
+    await auto_sync_if_needed()
+    return store.get_oi_analysis(symbol, lookback)
+
+
+@mcp.tool()
+async def get_basis_analysis(symbol: str = "NIFTY") -> Dict[str, Any]:
+    """
+    Calculates Basis (Futures Price - Spot Index Price) in real time.
+    Reveals whether Futures are leading or following Spot, determines Premium vs Discount,
+    and provides Spot-anchored ATM strike guidance for accurate option pricing.
+    Also returns Max Pain, Put-Call Ratio (PCR), and ATM Implied Volatility (IV).
+    """
+    return await controller.extract_spot_and_options_context(symbol)
 
 
 @mcp.tool()

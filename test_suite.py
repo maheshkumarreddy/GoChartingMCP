@@ -108,6 +108,37 @@ async def run_tests():
     except Exception as e:
         print(f"   ❌ FAIL: {e}")
 
+    # Test 7: get_oi_analysis Tool (Futures OI Change & 4-Quadrant Positioning)
+    total += 1
+    print("\n[Test 7] Testing get_oi_analysis tool (4-Quadrant Positioning)...")
+    try:
+        oi_res = store.get_oi_analysis("NIFTY_FUT", lookback=10)
+        if oi_res and "dominant_positioning" in oi_res:
+            print(f"   ✅ PASS: Latest OI: {oi_res.get('latest_oi')} | Net OI Change: {oi_res.get('net_oi_change_lookback')}")
+            print(f"            Dominant Positioning: {oi_res.get('dominant_positioning')}")
+            print(f"            Interpretation: {oi_res.get('interpretation')}")
+            passed += 1
+        else:
+            print(f"   ❌ FAIL: OI analysis failed: {oi_res}")
+    except Exception as e:
+        print(f"   ❌ FAIL: {e}")
+
+    # Test 8: get_basis_analysis Tool (Futures minus Spot & Options Greeks)
+    total += 1
+    print("\n[Test 8] Testing get_basis_analysis tool (Futures vs Spot)...")
+    try:
+        basis_res = await controller.extract_spot_and_options_context("NIFTY")
+        if basis_res and basis_res.get("status") == "ok":
+            print(f"   ✅ PASS: Futures Price: {basis_res.get('futures_price')} | Spot Price: {basis_res.get('spot_price')}")
+            print(f"            Basis: {basis_res.get('basis')} pts ({basis_res.get('basis_state')})")
+            print(f"            Spot ATM Strike: {basis_res.get('strike_guidance', {}).get('spot_atm_strike')} (Diff: {basis_res.get('strike_guidance', {}).get('strike_difference')} pts)")
+            print(f"            Options Context: Max Pain {basis_res.get('options_context', {}).get('max_pain')} | PCR OI {basis_res.get('options_context', {}).get('pcr_oi')} | ATM IV {basis_res.get('options_context', {}).get('atm_iv')}%")
+            passed += 1
+        else:
+            print(f"   ❌ FAIL: Basis extraction failed: {basis_res}")
+    except Exception as e:
+        print(f"   ❌ FAIL: {e}")
+
     # Summary
     print("\n" + "=" * 60)
     print(f"📊 Results: {passed}/{total} tests passed ({int(passed/total*100)}%)")

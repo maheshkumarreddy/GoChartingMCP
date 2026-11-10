@@ -39,8 +39,41 @@ class CandleOrderFlow:
     max_delta: int
     poc_price: float
     cvd: int = 0
+    open_interest: int = 0
+    oi_change: int = 0
+    oi_day_change: int = 0
+    positioning_quadrant: str = "NEUTRAL"
     tick_deltas: List[TickDeltaLevel] = field(default_factory=list)
     signals: Dict[str, Any] = field(default_factory=dict)
+
+
+def classify_positioning_quadrant(price_change: float, net_delta: int, oi_change: int) -> str:
+    """
+    Categorizes derivatives order flow into the 4 Institutional Positioning Quadrants:
+    - LONG_BUILDUP: Price UP, OI UP, Delta + (Fresh Aggressive Buying)
+    - SHORT_COVERING: Price UP, OI DOWN, Delta + (Bears exiting / short squeeze)
+    - SHORT_BUILDUP: Price DOWN, OI UP, Delta - (Fresh Aggressive Selling)
+    - LONG_UNWINDING: Price DOWN, OI DOWN, Delta - (Bulls liquidating inventory)
+    """
+    if price_change > 0:
+        if oi_change > 0:
+            return "LONG_BUILDUP"
+        elif oi_change < 0:
+            return "SHORT_COVERING"
+        return "BULLISH_DELTA"
+    elif price_change < 0:
+        if oi_change > 0:
+            return "SHORT_BUILDUP"
+        elif oi_change < 0:
+            return "LONG_UNWINDING"
+        return "BEARISH_DELTA"
+
+    # Flat candle: classify using Net Delta
+    if net_delta > 0:
+        return "LONG_BUILDUP" if oi_change > 0 else ("SHORT_COVERING" if oi_change < 0 else "NEUTRAL")
+    elif net_delta < 0:
+        return "SHORT_BUILDUP" if oi_change > 0 else ("LONG_UNWINDING" if oi_change < 0 else "NEUTRAL")
+    return "NEUTRAL"
 
 
 class MultiChartOrderFlowStore:
@@ -286,6 +319,13 @@ class MultiChartOrderFlowStore:
                 "absorption_at_high": (net_delta > 0 and close_p < high_p - (high_p - low_p) * 0.4)
             }
 
+            # OI data from candle
+            oi_val = int(c.get("open_interest", 0))
+            oi_chg = int(c.get("oi_change", 0))
+            oi_day_chg = int(c.get("oi_day_change", 0))
+            price_change = close_p - open_p
+            quadrant = classify_positioning_quadrant(price_change, net_delta, oi_chg)
+
             candle_obj = CandleOrderFlow(
                 timestamp=timestamp,
                 symbol=symbol,
@@ -302,6 +342,10 @@ class MultiChartOrderFlowStore:
                 max_delta=net_delta,
                 poc_price=poc_p,
                 cvd=current_cvd,
+                open_interest=oi_val,
+                oi_change=oi_chg,
+                oi_day_change=oi_day_chg,
+                positioning_quadrant=quadrant,
                 tick_deltas=tick_levels,
                 signals=signals
             )
@@ -325,6 +369,77 @@ class MultiChartOrderFlowStore:
 
     def get_history(self, symbol: str, limit: int = 10) -> List[CandleOrderFlow]:
         return self.candles.get(symbol, [])[:limit]
+
+    def get_oi_analysis(self, symbol: str, lookback: int = 10) -> Dict[str, Any]:
+        """
+        Analyzes Open Interest changes alongside Net Delta to categorize
+        institutional order flow into Long Buildup, Short Covering, Short Buildup,
+        and Long Unwinding.
+        """
+        candles = self.get_history(symbol, limit=lookback)
+        if not candles:
+            return {"error": f"No candles available for {symbol}."}
+
+        timeline = []
+        quadrant_counts = {
+            "LONG_BUILDUP": 0,
+            "SHORT_COVERING": 0,
+            "SHORT_BUILDUP": 0,
+            "LONG_UNWINDING": 0,
+            "BULLISH_DELTA": 0,
+            "BEARISH_DELTA": 0,
+            "NEUTRAL": 0
+        }
+        total_delta = 0
+        total_oi_change = 0
+
+        for c in reversed(candles):
+            total_delta += c.net_delta
+            total_oi_change += c.oi_change
+            q = c.positioning_quadrant
+            quadrant_counts[q] = quadrant_counts.get(q, 0) + 1
+
+            timeline.append({
+                "timestamp": c.timestamp,
+                "close": c.close_price,
+                "delta": c.net_delta,
+                "open_interest": c.open_interest,
+                "oi_change": c.oi_change,
+                "oi_day_change": c.oi_day_change,
+                "quadrant": q
+            })
+
+        latest = candles[0]
+        first = candles[-1]
+        price_change = latest.close_price - first.close_price
+
+        # Primary positioning theme
+        dominant_quadrant = max(
+            ["LONG_BUILDUP", "SHORT_COVERING", "SHORT_BUILDUP", "LONG_UNWINDING"],
+            key=lambda k: quadrant_counts.get(k, 0)
+        )
+        dominant_count = quadrant_counts.get(dominant_quadrant, 0)
+        dominant_pct = round((dominant_count / len(candles)) * 100, 1)
+
+        summary_explanation = {
+            "LONG_BUILDUP": "Aggressive fresh buyers entering new long positions (Bullish continuation).",
+            "SHORT_COVERING": "Short sellers forced to buy back/liquidate (Weak/exhaustion rally, vulnerable to reversal).",
+            "SHORT_BUILDUP": "Aggressive institutional sellers initiating fresh short positions (Bearish continuation).",
+            "LONG_UNWINDING": "Long holders liquidating/stop-losses triggering (Weak liquidation selloff)."
+        }.get(dominant_quadrant, "Mixed positioning.")
+
+        return {
+            "symbol": symbol,
+            "lookback_candles": len(candles),
+            "latest_oi": latest.open_interest,
+            "net_oi_change_lookback": total_oi_change,
+            "net_delta_lookback": total_delta,
+            "price_change_lookback": round(price_change, 2),
+            "dominant_positioning": f"{dominant_quadrant} ({dominant_pct}% of candles)",
+            "interpretation": summary_explanation,
+            "quadrant_distribution": {k: v for k, v in quadrant_counts.items() if v > 0},
+            "candle_timeline": timeline
+        }
 
     def list_active_symbols(self) -> List[Dict[str, Any]]:
         result = []
