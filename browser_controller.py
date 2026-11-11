@@ -95,7 +95,8 @@ FOOTPRINT_EXTRACTION_JS = """
             const levels = [];
             if (cluster && cluster.clusterForCandle) {
                 for (let [lvl, val] of cluster.clusterForCandle.entries()) {
-                    if (val.volume.total === 0 && val.volume.buy === 0 && val.volume.sell === 0) continue;
+                    const totVol = (val.volume && val.volume.total !== undefined) ? val.volume.total : ((val.volume?.buy || 0) + (val.volume?.sell || 0));
+                    if (totVol <= 0) continue;
                     levels.push({
                         price: lvl / priceDivisor,
                         buy_vol: val.volume.buy,

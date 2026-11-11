@@ -182,6 +182,17 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
         }
 
     session_info = get_market_session_info(candle.timestamp)
+    from orderflow_store import normalize_symbol
+    is_currently_streaming = (candle.symbol in store.streaming_symbols) or (normalize_symbol(candle.symbol) in store.streaming_symbols)
+    if is_currently_streaming and session_info["is_live"]:
+        stream_state = "LIVE"
+        stream_note = "Streaming live from open browser tab"
+    elif not is_currently_streaming:
+        stream_state = "CACHED_AFTER_RETARGET"
+        stream_note = "Tab was retargeted or closed; data is frozen cache from previous stream"
+    else:
+        stream_state = "STALE"
+        stream_note = f"Data is stale ({session_info['data_age_seconds']}s old)"
 
     return {
         "symbol": candle.symbol,
@@ -212,10 +223,12 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
         "post_close_note": "Post-market settlement/auction trade (15:31-15:40 IST), not active continuous trading." if candle.is_post_close else None,
         "signals": candle.signals,
         "market_session_state": session_info["market_session_state"],
-        "is_live": session_info["is_live"],
+        "is_live": session_info["is_live"] and is_currently_streaming,
         "data_age_seconds": session_info["data_age_seconds"],
         "current_time_ist": session_info["current_time_ist"],
-        "staleness_warning": session_info["staleness_warning"]
+        "staleness_warning": session_info["staleness_warning"],
+        "stream_state": stream_state,
+        "stream_note": stream_note
     }
 
 
@@ -251,6 +264,10 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
         })
 
     session_info = get_market_session_info(candle.timestamp)
+    from orderflow_store import normalize_symbol
+    is_currently_streaming = (candle.symbol in store.streaming_symbols) or (normalize_symbol(candle.symbol) in store.streaming_symbols)
+    stream_state = "LIVE" if (is_currently_streaming and session_info["is_live"]) else ("CACHED_AFTER_RETARGET" if not is_currently_streaming else "STALE")
+    stream_note = "Streaming live from open browser tab" if stream_state == "LIVE" else ("Tab was retargeted or closed; data is frozen cache from previous stream" if stream_state == "CACHED_AFTER_RETARGET" else f"Data is stale ({session_info['data_age_seconds']}s old)")
 
     return {
         "symbol": candle.symbol,
@@ -265,9 +282,11 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
         "tick_count": len(ladder),
         "tick_delta_ladder": ladder,
         "market_session_state": session_info["market_session_state"],
-        "is_live": session_info["is_live"],
+        "is_live": session_info["is_live"] and is_currently_streaming,
         "data_age_seconds": session_info["data_age_seconds"],
-        "staleness_warning": session_info["staleness_warning"]
+        "staleness_warning": session_info["staleness_warning"],
+        "stream_state": stream_state,
+        "stream_note": stream_note
     }
 
 
@@ -346,6 +365,17 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5, ex
         bias = "BULLISH_DIVERGENCE (Price falling on positive delta; sellers absorbed)"
 
     session_info = get_market_session_info(latest.timestamp)
+    from orderflow_store import normalize_symbol
+    is_currently_streaming = (symbol in store.streaming_symbols) or (normalize_symbol(symbol) in store.streaming_symbols)
+    if is_currently_streaming and session_info["is_live"]:
+        stream_state = "LIVE"
+        stream_note = "Streaming live from open browser tab"
+    elif not is_currently_streaming:
+        stream_state = "CACHED_AFTER_RETARGET"
+        stream_note = "Tab was retargeted or closed; data is frozen cache from previous stream"
+    else:
+        stream_state = "STALE"
+        stream_note = f"Data is stale ({session_info['data_age_seconds']}s old)"
 
     return {
         "symbol": symbol,
@@ -364,9 +394,11 @@ async def get_orderflow_signals(symbol: str = "NIFTY_FUT", lookback: int = 5, ex
         },
         "candle_breakdowns": recent_signals,
         "market_session_state": session_info["market_session_state"],
-        "is_live": session_info["is_live"],
+        "is_live": session_info["is_live"] and is_currently_streaming,
         "data_age_seconds": session_info["data_age_seconds"],
-        "staleness_warning": session_info["staleness_warning"]
+        "staleness_warning": session_info["staleness_warning"],
+        "stream_state": stream_state,
+        "stream_note": stream_note
     }
 
 

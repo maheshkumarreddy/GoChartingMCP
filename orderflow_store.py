@@ -551,6 +551,16 @@ class MultiChartOrderFlowStore:
         modal_explanation = get_quadrant_explanation(modal_quadrant)
 
         session_info = get_market_session_info(latest.timestamp)
+        is_currently_streaming = (target in self.streaming_symbols) or (normalize_symbol(target) in self.streaming_symbols)
+        if is_currently_streaming and session_info["is_live"]:
+            stream_state = "LIVE"
+            stream_note = "Streaming live from open browser tab"
+        elif not is_currently_streaming:
+            stream_state = "CACHED_AFTER_RETARGET"
+            stream_note = "Tab was retargeted or closed; stream stopped, data is frozen cache"
+        else:
+            stream_state = "STALE"
+            stream_note = f"Data is stale ({session_info['data_age_seconds']}s old)"
 
         return {
             "symbol": target,
@@ -571,9 +581,11 @@ class MultiChartOrderFlowStore:
             "interpretation": f"Window aggregate is {window_quadrant} (net delta: {total_delta:+d}, price: {price_change_window:+.1f}, OI: {total_oi_change:+d}). Modal individual bar: {modal_quadrant} ({modal_pct}%).",
             "quadrant_distribution": {k: v for k, v in quadrant_counts.items() if v > 0},
             "market_session_state": session_info["market_session_state"],
-            "is_live": session_info["is_live"],
+            "is_live": session_info["is_live"] and is_currently_streaming,
             "data_age_seconds": session_info["data_age_seconds"],
             "staleness_warning": session_info["staleness_warning"],
+            "stream_state": stream_state,
+            "stream_note": stream_note,
             "candle_timeline": timeline
         }
 
