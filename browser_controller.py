@@ -95,6 +95,7 @@ FOOTPRINT_EXTRACTION_JS = """
             const levels = [];
             if (cluster && cluster.clusterForCandle) {
                 for (let [lvl, val] of cluster.clusterForCandle.entries()) {
+                    if (val.volume.total === 0 && val.volume.buy === 0 && val.volume.sell === 0) continue;
                     levels.push({
                         price: lvl / priceDivisor,
                         buy_vol: val.volume.buy,
@@ -148,12 +149,25 @@ FOOTPRINT_EXTRACTION_JS = """
             cleanSymbol = rawSym.includes("BANK") ? "BANKNIFTY_FUT" : "NIFTY_FUT";
         }
 
+        let prevSessionClose = null;
+        if (mainData && mainData.length > 0) {
+            for (let i = mainData.length - 1; i >= 0; i--) {
+                const b = mainData[i];
+                const d = (b.date_str || (b.date ? new Date(b.date).toISOString() : '')).split('T')[0];
+                if (d && d !== latestDate) {
+                    prevSessionClose = b.close;
+                    break;
+                }
+            }
+        }
+
         return JSON.stringify({
             status: "ok",
             symbol: cleanSymbol,
             raw_symbol: rawSym,
             contract_name: sec.name || cleanSymbol,
             session_date: latestDate,
+            prev_session_close: prevSessionClose,
             candlesCount: results.length,
             candles: results
         });
@@ -271,14 +285,14 @@ class GoChartingBrowserController:
                 expiry = f"{day}-{month}"
 
         # Look for strike & type
-        m = re.search(r'(\d{5})\s*(CE|PE|CALL|PUT)', symbol, re.I)
+        m = re.search(r'(\d{4,5})[\s_\-:]*(CE|PE|CALL|PUT)', symbol, re.I)
         if m:
             strike = m.group(1)
             t = m.group(2).upper()
             opt_type = 'CE' if ('CE' in t or 'CALL' in t) else 'PE'
             return True, strike, opt_type, expiry
 
-        m2 = re.search(r'(CE|PE|CALL|PUT)\s*(\d{5})', symbol, re.I)
+        m2 = re.search(r'(CE|PE|CALL|PUT)[\s_\-:]*(\d{4,5})', symbol, re.I)
         if m2:
             t = m2.group(1).upper()
             strike = m2.group(2)
@@ -314,24 +328,23 @@ class GoChartingBrowserController:
                 const targetExpiry = {expiry_js};
 
                 const isChainModalOpen = () => {{
-                    const header = document.querySelector('.call-header');
-                    return !!header && header.offsetParent !== null;
+                    const overlay = document.querySelector('.modaloverlay');
+                    if (overlay && overlay.offsetParent !== null) return true;
+                    return Array.from(document.querySelectorAll('h2, div, span')).some(el => (el.textContent || '').includes('OPTIONS Chain'));
                 }};
 
                 // 1. Open Options Chain modal if not open
                 if (!isChainModalOpen()) {{
-                    let searchDialog = document.querySelector('[class*="erbwhql110"]');
-                    if (!searchDialog || searchDialog.clientHeight < 100) {{
-                        const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
-                                          document.querySelector('.ohlc-symbol-button') ||
-                                          document.querySelector('.css-1gi9g8n');
-                        if (searchBtn) {{
-                            searchBtn.click();
-                            await new Promise(r => setTimeout(r, 600));
-                        }}
+                    const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
+                                      document.querySelector('.ohlc-symbol-button') ||
+                                      document.querySelector('.css-1gi9g8n');
+                    if (searchBtn) {{
+                        searchBtn.click();
+                        await new Promise(r => setTimeout(r, 600));
                     }}
 
-                    const optTab = Array.from(document.querySelectorAll('button')).find(b => 
+                    const portal = document.querySelector('#portal') || document.body;
+                    const optTab = Array.from(portal.querySelectorAll('button, span')).find(b => 
                         (b.textContent || '').trim() === 'Options'
                     );
                     if (optTab) {{
@@ -339,11 +352,27 @@ class GoChartingBrowserController:
                         await new Promise(r => setTimeout(r, 400));
                     }}
 
-                    const optRow = Array.from(document.querySelectorAll('[class*="erbwhql46"], [class*="erbwhql38"]')).find(el => 
-                        (el.textContent || '').includes('NIFTY OPTIONS')
+                    const input = portal.querySelector('input[placeholder="Search symbol..."]') || document.querySelector('#symbol-search-input');
+                    if (input && input.value !== 'NIFTY') {{
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                        if (nativeSetter) {{
+                            nativeSetter.call(input, 'NIFTY');
+                        }} else {{
+                            input.value = 'NIFTY';
+                        }}
+                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        await new Promise(r => setTimeout(r, 500));
+                    }}
+
+                    const rows = Array.from(portal.querySelectorAll('div, span')).filter(el => 
+                        (el.textContent || '').trim() === 'NIFTY OPTIONS'
                     );
-                    if (optRow) {{
-                        optRow.click();
+                    if (rows.length > 0) {{
+                        const targetRow = rows[0].closest('[class*="erbwhql"]') || rows[0];
+                        targetRow.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true }}));
+                        targetRow.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true }}));
+                        targetRow.click();
                         for (let i = 0; i < 20; i++) {{
                             await new Promise(r => setTimeout(r, 200));
                             if (isChainModalOpen()) break;
@@ -399,7 +428,9 @@ class GoChartingBrowserController:
                 // Allow GoCharting WebSocket time to stream new footprint candles
                 await new Promise(r => setTimeout(r, 1500));
 
-                const closeBtn = document.querySelector('.css-1mft2lf');
+                const closeBtn = document.querySelector('.modaloverlay button') ||
+                                 document.querySelector('.css-1mft2lf') ||
+                                 Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === '×');
                 if (closeBtn) closeBtn.click();
 
                 return {{
@@ -418,9 +449,9 @@ class GoChartingBrowserController:
             js = f"""
             (async () => {{
                 // Dismiss options chain modal if open
-                const closeBtn = Array.from(document.querySelectorAll('button, span')).find(b => 
-                    (b.textContent === '×' || b.textContent === '✕') && b.className && b.className.includes('css-')
-                );
+                const closeBtn = document.querySelector('.modaloverlay button') ||
+                                 document.querySelector('.css-1mft2lf') ||
+                                 Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === '×');
                 if (closeBtn) {{
                     closeBtn.click();
                     await new Promise(r => setTimeout(r, 400));
@@ -549,7 +580,9 @@ class GoChartingBrowserController:
         """
         Extracts real-time Spot underlying price, Basis (Futures - Spot), Max Pain,
         PCR (Put-Call Ratio), and ATM IV from GoCharting's underlyingStoreMap.
+        Explicitly binds to the FUTURES tab to guarantee futures_price is the index future.
         """
+        fut_idx = self.find_tab_by_target("FUTURES")
         js = """
         (() => {
             try {
@@ -574,10 +607,11 @@ class GoChartingBrowserController:
                 const oc = state?.options_chain;
                 const firstSeries = oc?.seriesData?.[0] || {};
 
-                // Current futures close price from main chart
+                // Current futures close price from main chart on the FUTURES tab
                 const mainData = c0?.dataStore?.getState()?.main?.mainChartData;
                 const lastFutureBar = mainData ? mainData[mainData.length - 1] : null;
                 const futuresPrice = lastFutureBar ? lastFutureBar.close : null;
+                const futuresBarTime = lastFutureBar ? (lastFutureBar.date ? new Date(lastFutureBar.date).toISOString() : (lastFutureBar.date_str || null)) : null;
                 const spotPrice = firstSeries.underlying_price || null;
                 const basis = (futuresPrice !== null && spotPrice !== null) ? Number((futuresPrice - spotPrice).toFixed(2)) : null;
                 const basisPct = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 100).toFixed(4)) : null;
@@ -603,13 +637,14 @@ class GoChartingBrowserController:
                     futures_symbol: store?.security?.ticker || 'NSE:NIFTY-I',
                     underlying_symbol: foundKey,
                     futures_price: futuresPrice,
+                    futures_bar_time: futuresBarTime,
                     spot_price: spotPrice,
                     basis: basis,
                     basis_pct: basisPct,
                     basis_percent: basisPct,
                     basis_bps: basisBps,
                     basis_state: basisState,
-                    basis_unit_note: 'basis is points (futures - spot). basis_pct is percentage value (-0.0665 means -0.0665%). basis_bps is basis points (-6.65 bps).',
+                    basis_unit_note: 'basis is points (futures - spot). basis_pct is percentage value (+0.2380 means +0.238%). basis_bps is basis points (+23.8 bps).',
                     strike_guidance: {
                         spot_atm_strike: spotAtmStrike,
                         futures_atm_strike: futuresAtmStrike,
@@ -633,7 +668,14 @@ class GoChartingBrowserController:
             }
         })()
         """
-        res = await self.execute_js(js)
+        res = await self.execute_js(js, tab_index=fut_idx)
+        if isinstance(res, dict) and res.get("status") == "ok":
+            from orderflow_store import get_market_session_info
+            session_info = get_market_session_info(res.get("futures_bar_time"))
+            res["market_session_state"] = session_info["market_session_state"]
+            res["is_live"] = session_info["is_live"]
+            res["data_age_seconds"] = session_info["data_age_seconds"]
+            res["staleness_warning"] = session_info["staleness_warning"]
         return res if isinstance(res, dict) else {"error": str(res)}
 
     async def capture_screenshot(self, output_path: str = "chart_screenshot.png", tab_index: int = 0) -> Dict[str, Any]:

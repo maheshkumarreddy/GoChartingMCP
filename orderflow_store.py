@@ -41,10 +41,12 @@ class CandleOrderFlow:
     total_volume: int
     total_buy_vol: int
     total_sell_vol: int
-    net_delta: int
-    min_delta: int
-    max_delta: int
-    poc_price: float
+    classified_volume: int = 0
+    unclassified_volume: int = 0
+    net_delta: int = 0
+    min_delta: int = 0
+    max_delta: int = 0
+    poc_price: float = 0.0
     cvd: int = 0
     open_interest: int = 0
     oi_change: int = 0
@@ -53,6 +55,36 @@ class CandleOrderFlow:
     is_post_close: bool = False
     tick_deltas: List[TickDeltaLevel] = field(default_factory=list)
     signals: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "timestamp": self.timestamp,
+            "open": self.open_price,
+            "high": self.high_price,
+            "low": self.low_price,
+            "close": self.close_price,
+            "prev_close": self.prev_close_price,
+            "price_change": self.price_change,
+            "volume": self.total_volume,
+            "buy_volume": self.total_buy_vol,
+            "sell_volume": self.total_sell_vol,
+            "classified_volume": self.classified_volume,
+            "unclassified_volume": self.unclassified_volume,
+            "volume_note": "volume is exchange total matched volume; classified_volume is footprint classified (buy+sell); unclassified_volume is unclassified exchange trades.",
+            "net_delta": self.net_delta,
+            "min_delta": self.min_delta,
+            "max_delta": self.max_delta,
+            "poc_price": self.poc_price,
+            "cvd": self.cvd,
+            "open_interest": self.open_interest,
+            "oi_change": self.oi_change,
+            "oi_day_change": self.oi_day_change,
+            "positioning_quadrant": self.positioning_quadrant,
+            "is_post_close": self.is_post_close,
+            "signals": self.signals
+        }
 
 
 def normalize_symbol(raw_ticker: str) -> str:
@@ -118,8 +150,13 @@ def get_market_session_info(latest_candle_time_str: Optional[str] = None) -> Dic
                 data_age_seconds = 0
             is_live = (data_age_seconds <= 180) and (session_state in ["OPEN", "POST_MARKET"])
             if data_age_seconds > 300:
-                hours = round(data_age_seconds / 3600, 1)
-                warning = f"Data is from previous market session ({hours} hours old). Market is currently {session_state}."
+                candle_ist = dt.astimezone(IST)
+                if candle_ist.date() == now_ist.date():
+                    mins = round(data_age_seconds / 60, 1)
+                    warning = f"Data is stale by {mins} minutes in the current session. Market is currently {session_state}."
+                else:
+                    hours = round(data_age_seconds / 3600, 1)
+                    warning = f"Data is from previous market session ({hours} hours old). Market is currently {session_state}."
         except Exception:
             pass
 
@@ -208,8 +245,16 @@ class MultiChartOrderFlowStore:
         self.running_cvd: Dict[str, int] = {}
         # Active session date per symbol (e.g. '2026-11-09') to handle new day transitions cleanly
         self.active_session_date: Dict[str, str] = {}
+        # Prior market session close price per symbol (for overnight gap preservation)
+        self.prior_session_close: Dict[str, float] = {}
+        # Set of normalized symbols actively streaming in current browser tabs
+        self.streaming_symbols: Set[str] = set()
         # Pending UI command for browser bridge
         self.pending_command: Optional[Dict[str, Any]] = None
+
+    def update_active_streaming_symbols(self, symbols: List[str]):
+        """Updates the set of symbols actively streaming from browser tabs."""
+        self.streaming_symbols = {normalize_symbol(s) for s in symbols if s}
 
     def update_metadata(self, symbol: str, tick_size: float = 0.05,
                         display_tick_size: float = 1.0, precision: int = 2, price_divisor: float = 10.0):
@@ -229,9 +274,13 @@ class MultiChartOrderFlowStore:
             return norm
 
         clean_q = query.upper().replace(" ", "").replace("_", "").replace("-", "")
+        is_bank_q = "BANK" in clean_q
         for s in self.candles.keys():
             clean_s = s.upper().replace(" ", "").replace("_", "").replace("-", "")
-            if clean_q == clean_s or clean_q in clean_s or clean_s in clean_q:
+            is_bank_s = "BANK" in clean_s
+            if is_bank_q != is_bank_s:
+                continue
+            if clean_q == clean_s or clean_q in clean_s:
                 return s
         return norm
 
@@ -261,6 +310,13 @@ class MultiChartOrderFlowStore:
                 self.running_cvd[symbol] = 0
             self.active_session_date[symbol] = session_date
 
+        prev_sess_close = payload.get("prev_session_close")
+        if prev_sess_close is not None:
+            try:
+                self.prior_session_close[symbol] = float(prev_sess_close)
+            except Exception:
+                pass
+
         self.update_metadata(symbol, tick_size=0.05, display_tick_size=1.0, precision=2)
 
         # Sort incoming candles chronologically ascending (oldest first)
@@ -283,7 +339,7 @@ class MultiChartOrderFlowStore:
             poc_p = float(c.get("poc_price", 0))
 
             if idx == 0:
-                prev_close = open_p
+                prev_close = self.prior_session_close.get(symbol, open_p)
             price_change = round(close_p - prev_close, 2)
 
             raw_levels = c.get("levels", [])
@@ -291,6 +347,8 @@ class MultiChartOrderFlowStore:
 
             total_buy = int(c.get("total_buy_vol", sum(lvl.get("buy_vol", 0) for lvl in raw_levels)))
             total_sell = int(c.get("total_sell_vol", sum(lvl.get("sell_vol", 0) for lvl in raw_levels)))
+            classified_vol = total_buy + total_sell
+            unclassified_vol = max(0, volume - classified_vol)
             net_delta = int(c.get("net_delta", total_buy - total_sell))
 
             # Min / Max intra-candle delta (real from GoCharting candleLevelTotals)
@@ -370,6 +428,8 @@ class MultiChartOrderFlowStore:
                 total_volume=volume,
                 total_buy_vol=total_buy,
                 total_sell_vol=total_sell,
+                classified_volume=classified_vol,
+                unclassified_volume=unclassified_vol,
                 net_delta=net_delta,
                 min_delta=min_delta,
                 max_delta=max_delta,
@@ -507,7 +567,7 @@ class MultiChartOrderFlowStore:
             "window_interpretation": f"Window Aggregate ({len(candles)} candles): {window_explanation}",
             "modal_candle_quadrant": f"{modal_quadrant} ({modal_pct}% of candles)",
             "modal_quadrant_interpretation": modal_explanation,
-            "dominant_positioning": f"{modal_quadrant} ({modal_pct}% of candles)",
+            "dominant_positioning": window_quadrant,
             "interpretation": f"Window aggregate is {window_quadrant} (net delta: {total_delta:+d}, price: {price_change_window:+.1f}, OI: {total_oi_change:+d}). Modal individual bar: {modal_quadrant} ({modal_pct}%).",
             "quadrant_distribution": {k: v for k, v in quadrant_counts.items() if v > 0},
             "market_session_state": session_info["market_session_state"],
@@ -523,6 +583,17 @@ class MultiChartOrderFlowStore:
             if candles:
                 latest = candles[0]
                 session_info = get_market_session_info(latest.timestamp)
+                is_currently_streaming = (sym in self.streaming_symbols) or (normalize_symbol(sym) in self.streaming_symbols)
+                if is_currently_streaming and session_info["is_live"]:
+                    stream_state = "LIVE"
+                    stream_note = "Streaming live from open browser tab"
+                elif not is_currently_streaming:
+                    stream_state = "CACHED_AFTER_RETARGET"
+                    stream_note = "Tab was retargeted or closed; stream stopped, data is frozen cache"
+                else:
+                    stream_state = "STALE"
+                    stream_note = f"Data is stale ({session_info['data_age_seconds']}s old)"
+
                 result.append({
                     "symbol": sym,
                     "session_date": self.active_session_date.get(sym),
@@ -533,9 +604,12 @@ class MultiChartOrderFlowStore:
                     "min_delta": latest.min_delta,
                     "max_delta": latest.max_delta,
                     "cvd": latest.cvd,
-                    "is_live": session_info["is_live"],
+                    "is_live": session_info["is_live"] and is_currently_streaming,
                     "data_age_seconds": session_info["data_age_seconds"],
-                    "market_session_state": session_info["market_session_state"]
+                    "market_session_state": session_info["market_session_state"],
+                    "staleness_warning": session_info["staleness_warning"],
+                    "stream_state": stream_state,
+                    "stream_note": stream_note
                 })
         return result
 

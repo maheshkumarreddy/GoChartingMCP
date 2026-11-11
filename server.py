@@ -32,9 +32,12 @@ async def auto_sync_if_needed():
     """Fetches latest footprint data from ALL open GoCharting tabs via CDP in parallel."""
     try:
         series_list = await controller.extract_live_footprint_from_all_tabs()
+        active_syms = []
         for series in series_list:
             if series and series.get("status") == "ok":
                 store.sync_from_browser_series(series)
+                active_syms.append(series.get("symbol", ""))
+        store.update_active_streaming_symbols(active_syms)
     except Exception as e:
         print(f"[AutoSync Warning] {e}")
 
@@ -63,15 +66,22 @@ async def browser_sync_now() -> Dict[str, Any]:
     """
     await auto_sync_if_needed()
     active = store.list_active_symbols()
-    session_info = get_market_session_info(active[0]["latest_time"] if active else None)
+    live_charts = [s for s in active if s.get("is_live")]
+    freshest = min(active, key=lambda s: s.get("data_age_seconds") if s.get("data_age_seconds") is not None else 999999) if active else None
+    rep_chart = live_charts[0] if live_charts else freshest
+    session_info = get_market_session_info(rep_chart["latest_time"] if rep_chart else None)
+    aggregate_is_live = any(s.get("is_live") for s in active)
+    streaming_symbols = [s["symbol"] for s in active if s.get("stream_state") == "LIVE"] or [s["symbol"] for s in active if s.get("is_live")]
+
     return {
         "status": "ok",
-        "synced_symbols": [s["symbol"] for s in active],
+        "synced_symbols": streaming_symbols,
+        "all_cached_symbols": [s["symbol"] for s in active],
         "active_charts": active,
         "market_session_state": session_info["market_session_state"],
-        "is_live": session_info["is_live"],
-        "data_age_seconds": session_info["data_age_seconds"],
-        "staleness_warning": session_info["staleness_warning"]
+        "is_live": aggregate_is_live,
+        "data_age_seconds": rep_chart["data_age_seconds"] if rep_chart else None,
+        "staleness_warning": rep_chart.get("staleness_warning") if rep_chart else None
     }
 
 
@@ -186,6 +196,9 @@ async def get_latest_candle(symbol: str = "NIFTY_FUT") -> Dict[str, Any]:
         "volume": candle.total_volume,
         "buy_volume": candle.total_buy_vol,
         "sell_volume": candle.total_sell_vol,
+        "classified_volume": candle.classified_volume,
+        "unclassified_volume": candle.unclassified_volume,
+        "volume_note": "volume is exchange total matched volume; classified_volume is footprint classified (buy+sell); unclassified_volume is unclassified exchange trades.",
         "net_delta": candle.net_delta,
         "min_delta": candle.min_delta,
         "max_delta": candle.max_delta,
@@ -253,7 +266,8 @@ async def get_delta_ladder(symbol: str = "NIFTY_FUT", candle_index: int = 0) -> 
         "tick_delta_ladder": ladder,
         "market_session_state": session_info["market_session_state"],
         "is_live": session_info["is_live"],
-        "data_age_seconds": session_info["data_age_seconds"]
+        "data_age_seconds": session_info["data_age_seconds"],
+        "staleness_warning": session_info["staleness_warning"]
     }
 
 
