@@ -407,7 +407,13 @@ class GoChartingBrowserController:
                     }}
                 }}
 
-                // 3. Find target strike row in table
+                // 3. Wait for rows and find target strike row in table
+                for (let i = 0; i < 25; i++) {{
+                    const r = document.querySelectorAll('tr');
+                    if (r.length > 5) break;
+                    await new Promise(res => setTimeout(res, 200));
+                }}
+
                 const rows = Array.from(document.querySelectorAll('tr'));
                 const targetRow = rows.find(r => {{
                     const sCell = r.querySelector('.strike');
@@ -581,14 +587,26 @@ class GoChartingBrowserController:
         """
         Extracts real-time Spot underlying price, Basis (Futures - Spot), Max Pain,
         PCR (Put-Call Ratio), and ATM IV from GoCharting's underlyingStoreMap.
-        Explicitly binds to the FUTURES tab to guarantee futures_price is the index future.
+        Explicitly iterates tabs to guarantee futures_price is the index future (> 5,000 pts) and not an option premium.
         """
-        fut_idx = self.find_tab_by_target("FUTURES")
         js = """
         (() => {
             try {
                 const c0 = window.rootReduxStore?.getState()?.chartComponentList?.[0];
                 const store = c0?.store?.getState();
+                const sec = store?.security || {};
+                const ticker = (sec.ticker || sec.symbol || "").toUpperCase();
+
+                // Current futures close price from main chart on the FUTURES tab
+                const mainData = c0?.dataStore?.getState()?.main?.mainChartData;
+                const lastFutureBar = mainData ? mainData[mainData.length - 1] : null;
+                const futuresPrice = lastFutureBar ? lastFutureBar.close : null;
+
+                // Guard: Reject if this tab is an option chart
+                if (sec.segment === "OPTIONS" || sec.option_type || ticker.includes("CE") || ticker.includes("PE") || (futuresPrice !== null && futuresPrice < 5000)) {
+                    return { error: 'Tab is an option chart (' + ticker + ', price=' + futuresPrice + '), not index futures.' };
+                }
+
                 const rootStore = store?.transient?.rootStore?.getState();
                 const usm = rootStore?.transient?.underlyingStoreMap;
 
@@ -608,10 +626,6 @@ class GoChartingBrowserController:
                 const oc = state?.options_chain;
                 const firstSeries = oc?.seriesData?.[0] || {};
 
-                // Current futures close price from main chart on the FUTURES tab
-                const mainData = c0?.dataStore?.getState()?.main?.mainChartData;
-                const lastFutureBar = mainData ? mainData[mainData.length - 1] : null;
-                const futuresPrice = lastFutureBar ? lastFutureBar.close : null;
                 const futuresBarTime = lastFutureBar ? (lastFutureBar.date ? new Date(lastFutureBar.date).toISOString() : (lastFutureBar.date_str || null)) : null;
                 const spotPrice = firstSeries.underlying_price || null;
                 const basis = (futuresPrice !== null && spotPrice !== null) ? Number((futuresPrice - spotPrice).toFixed(2)) : null;
@@ -669,15 +683,33 @@ class GoChartingBrowserController:
             }
         })()
         """
-        res = await self.execute_js(js, tab_index=fut_idx)
-        if isinstance(res, dict) and res.get("status") == "ok":
-            from orderflow_store import get_market_session_info
-            session_info = get_market_session_info(res.get("futures_bar_time"))
-            res["market_session_state"] = session_info["market_session_state"]
-            res["is_live"] = session_info["is_live"]
-            res["data_age_seconds"] = session_info["data_age_seconds"]
-            res["staleness_warning"] = session_info["staleness_warning"]
-        return res if isinstance(res, dict) else {"error": str(res)}
+        tabs = self.get_all_gocharting_tabs()
+        if not tabs:
+            return {"error": "Bot Chrome instance not detected on port 9222. Ensure launch_bot_chrome.sh is running."}
+
+        candidates = []
+        for i, t in enumerate(tabs):
+            tu = t.get("title", "").upper()
+            if ("-I" in tu or "FUT" in tu) and "CE" not in tu and "PE" not in tu:
+                candidates.insert(0, i)
+            else:
+                candidates.append(i)
+
+        last_err = None
+        for idx in candidates:
+            res = await self.execute_js(js, tab_index=idx)
+            if isinstance(res, dict) and res.get("status") == "ok":
+                from orderflow_store import get_market_session_info
+                session_info = get_market_session_info(res.get("futures_bar_time"))
+                res["market_session_state"] = session_info["market_session_state"]
+                res["is_live"] = session_info["is_live"]
+                res["data_age_seconds"] = session_info["data_age_seconds"]
+                res["staleness_warning"] = session_info["staleness_warning"]
+                return res
+            elif isinstance(res, dict) and res.get("error"):
+                last_err = res.get("error")
+
+        return {"error": f"Failed to extract futures basis: {last_err}"}
 
     async def capture_screenshot(self, output_path: str = "chart_screenshot.png", tab_index: int = 0) -> Dict[str, Any]:
         """Captures a full screenshot of the active GoCharting window."""

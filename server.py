@@ -25,7 +25,7 @@ from browser_controller import controller
 MCP_ADMIN_TOKEN = os.environ.get("MCP_ADMIN_TOKEN", "").strip()
 
 # Initialize MCP Server
-mcp = MCPServer(name="GoCharting-OrderFlow-MCP")
+mcp = MCPServer(name="GoCharting-OrderFlow-MCP", version="2.2.0")
 
 
 async def auto_sync_if_needed():
@@ -517,7 +517,7 @@ async def handle_command(request: Request):
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request):
-    return PlainTextResponse("GoCharting Order Flow MCP Server OK")
+    return PlainTextResponse("GoCharting Order Flow MCP Server v2.2.0 OK")
 
 
 @mcp.custom_route("/api/status", methods=["GET"])
@@ -526,6 +526,7 @@ async def get_status(request: Request):
     await auto_sync_if_needed()
     return JSONResponse({
         "status": "online",
+        "version": "2.2.0",
         "service": "GoCharting Order Flow MCP Server",
         "transport": "SSE on /sse",
         "active_symbols": store.list_active_symbols()
