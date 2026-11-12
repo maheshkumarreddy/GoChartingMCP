@@ -250,8 +250,8 @@ class GoChartingBrowserController:
         tabs = self.get_all_gocharting_tabs()
         if not tabs:
             return 0
-        if tab_index is not None:
-            return min(max(0, tab_index), len(tabs) - 1)
+        
+        # When targeting OPTION, prioritize tabs displaying options (CE/PE) or tab 1
         if target:
             target_upper = target.upper()
             if target_upper in ["OPTION", "OPTIONS", "OPT", "STRIKE"]:
@@ -266,6 +266,10 @@ class GoChartingBrowserController:
                     if "-I" in title_upper or "FUT" in title_upper:
                         return idx
                 return 0
+
+        if tab_index is not None:
+            return min(max(0, tab_index), len(tabs) - 1)
+
         return 0
 
     @staticmethod
@@ -314,8 +318,11 @@ class GoChartingBrowserController:
         is_opt, strike, opt_type, parsed_expiry = self.parse_option_symbol(symbol)
         final_expiry = expiry or parsed_expiry
 
-        if target_tab is None and is_opt:
+        if is_opt:
             target_tab = "OPTION"
+            # Prevent defaulting tab_index=0 to clobber the FUTURES tab when multiple tabs exist
+            if tab_index == 0 and len(self.get_all_gocharting_tabs()) > 1:
+                tab_index = None
 
         idx = self.find_tab_by_target(target=target_tab, tab_index=tab_index)
 
@@ -338,10 +345,12 @@ class GoChartingBrowserController:
                 if (!isChainModalOpen()) {{
                     const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
                                       document.querySelector('.ohlc-symbol-button') ||
-                                      document.querySelector('.css-1gi9g8n');
+                                      document.querySelector('.popovers-trigger button') ||
+                                      document.querySelector('.css-1gi9g8n') ||
+                                      document.querySelector('.symbol-title');
                     if (searchBtn) {{
                         searchBtn.click();
-                        await new Promise(r => setTimeout(r, 600));
+                        await new Promise(r => setTimeout(r, 250));
                     }}
 
                     const portal = document.querySelector('#portal') || document.body;
@@ -350,7 +359,7 @@ class GoChartingBrowserController:
                     );
                     if (optTab) {{
                         optTab.click();
-                        await new Promise(r => setTimeout(r, 400));
+                        await new Promise(r => setTimeout(r, 200));
                     }}
 
                     const input = portal.querySelector('input[placeholder="Search symbol..."]') || document.querySelector('#symbol-search-input');
@@ -363,7 +372,7 @@ class GoChartingBrowserController:
                         }}
                         input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        await new Promise(r => setTimeout(r, 500));
+                        await new Promise(r => setTimeout(r, 250));
                     }}
 
                     const rows = Array.from(portal.querySelectorAll('div, span')).filter(el => 
@@ -374,8 +383,8 @@ class GoChartingBrowserController:
                         targetRow.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true }}));
                         targetRow.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true }}));
                         targetRow.click();
-                        for (let i = 0; i < 20; i++) {{
-                            await new Promise(r => setTimeout(r, 200));
+                        for (let i = 0; i < 30; i++) {{
+                            await new Promise(r => setTimeout(r, 50));
                             if (isChainModalOpen()) break;
                         }}
                     }}
@@ -403,15 +412,15 @@ class GoChartingBrowserController:
                     }});
                     if (expMatch) {{
                         expMatch.click();
-                        await new Promise(r => setTimeout(r, 800));
+                        await new Promise(r => setTimeout(r, 250));
                     }}
                 }}
 
                 // 3. Wait for rows and find target strike row in table
-                for (let i = 0; i < 25; i++) {{
+                for (let i = 0; i < 30; i++) {{
                     const r = document.querySelectorAll('tr');
                     if (r.length > 5) break;
-                    await new Promise(res => setTimeout(res, 200));
+                    await new Promise(res => setTimeout(res, 50));
                 }}
 
                 const rows = Array.from(document.querySelectorAll('tr'));
@@ -433,7 +442,7 @@ class GoChartingBrowserController:
                 clickTarget.scrollIntoView({{ block: 'center', inline: 'center' }});
                 clickTarget.click();
                 // Allow GoCharting WebSocket time to stream new footprint candles
-                await new Promise(r => setTimeout(r, 1500));
+                await new Promise(r => setTimeout(r, 400));
 
                 const closeBtn = document.querySelector('.modaloverlay button') ||
                                  document.querySelector('.css-1mft2lf') ||
@@ -461,20 +470,22 @@ class GoChartingBrowserController:
                                  Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === '×');
                 if (closeBtn) {{
                     closeBtn.click();
-                    await new Promise(r => setTimeout(r, 400));
+                    await new Promise(r => setTimeout(r, 200));
                 }}
 
                 const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
                                   document.querySelector('.ohlc-symbol-button') ||
                                   document.querySelector('.popovers-trigger button') ||
                                   document.querySelector('.css-1gi9g8n') ||
-                                  document.querySelector('.symbol-title');
+                                  document.querySelector('.symbol-title') ||
+                                  document.querySelector('button[class*="symbol"]');
                 if (searchBtn) {{
                     searchBtn.click();
-                    await new Promise(r => setTimeout(r, 400));
+                    await new Promise(r => setTimeout(r, 250));
                     
                     const input = document.querySelector('.symbol-search-input input') ||
                                   document.querySelector('input[placeholder*="Search"]') ||
+                                  document.querySelector('#symbol-search-input') ||
                                   document.querySelector('input[type="text"]');
                     if (input) {{
                         input.focus();
@@ -486,7 +497,7 @@ class GoChartingBrowserController:
                         }}
                         input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        await new Promise(r => setTimeout(r, 600));
+                        await new Promise(r => setTimeout(r, 350));
                         
                         const firstResult = document.querySelector('.symbol-item') || document.querySelector('[data-qa*="search-result"]');
                         if (firstResult) {{
@@ -588,9 +599,10 @@ class GoChartingBrowserController:
         Extracts real-time Spot underlying price, Basis (Futures - Spot), Max Pain,
         PCR (Put-Call Ratio), and ATM IV from GoCharting's underlyingStoreMap.
         Explicitly iterates tabs to guarantee futures_price is the index future (> 5,000 pts) and not an option premium.
+        Automatically detects stale/cached spot prices and triggers an in-browser options chain refresh pulse when needed.
         """
         js = """
-        (() => {
+        (async () => {
             try {
                 const c0 = window.rootReduxStore?.getState()?.chartComponentList?.[0];
                 const store = c0?.store?.getState();
@@ -621,13 +633,104 @@ class GoChartingBrowserController:
                 }
                 if (!foundKey) return { error: 'No underlying spot data currently loaded in GoCharting.' };
 
-                const sub = usm.get(foundKey);
-                const state = sub?.getState ? sub.getState() : sub;
-                const oc = state?.options_chain;
-                const firstSeries = oc?.seriesData?.[0] || {};
+                let sub = usm.get(foundKey);
+                let state = sub?.getState ? sub.getState() : sub;
+                let oc = state?.options_chain;
+                let firstSeries = oc?.seriesData?.[0] || {};
+                let spotPrice = firstSeries.underlying_price || null;
+
+                // Check if spot price is stale (Monday close 25044.65 or diverged > 80 pts from futures)
+                const isStale = (spotPrice === 25044.65) || (futuresPrice !== null && spotPrice !== null && Math.abs(futuresPrice - spotPrice) > 80);
+
+                if (isStale || !spotPrice) {
+                    try {
+                        const isChainModalOpen = () => {
+                            const overlay = document.querySelector('.modaloverlay');
+                            if (overlay && overlay.offsetParent !== null) return true;
+                            return Array.from(document.querySelectorAll('h2, div, span')).some(el => (el.textContent || '').includes('OPTIONS Chain'));
+                        };
+
+                        if (isChainModalOpen()) {
+                            const closeBtn = document.querySelector('.modaloverlay button') ||
+                                             document.querySelector('.css-1mft2lf') ||
+                                             Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === '×');
+                            if (closeBtn) {
+                                closeBtn.click();
+                                await new Promise(r => setTimeout(r, 200));
+                            }
+                        }
+
+                        const searchBtn = document.querySelector('[aria-label="Search symbol..."]') ||
+                                          document.querySelector('.ohlc-symbol-button') ||
+                                          document.querySelector('.popovers-trigger button') ||
+                                          document.querySelector('.css-1gi9g8n') ||
+                                          document.querySelector('.symbol-title');
+                        if (searchBtn) {
+                            searchBtn.click();
+                            await new Promise(r => setTimeout(r, 250));
+
+                            const portal = document.querySelector('#portal') || document.body;
+                            const optTab = Array.from(portal.querySelectorAll('button, span')).find(b => 
+                                (b.textContent || '').trim() === 'Options'
+                            );
+                            if (optTab) {
+                                optTab.click();
+                                await new Promise(r => setTimeout(r, 200));
+                            }
+
+                            const input = portal.querySelector('input[placeholder="Search symbol..."]') || document.querySelector('#symbol-search-input');
+                            if (input) {
+                                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                                if (nativeSetter) nativeSetter.call(input, 'NIFTY');
+                                else input.value = 'NIFTY';
+                                input.dispatchEvent(new Event('input', { bubbles: true }));
+                                input.dispatchEvent(new Event('change', { bubbles: true }));
+                                await new Promise(r => setTimeout(r, 250));
+                            }
+
+                            const rows = Array.from(portal.querySelectorAll('div, span')).filter(el => 
+                                (el.textContent || '').trim() === 'NIFTY OPTIONS'
+                            );
+                            if (rows.length > 0) {
+                                const targetRow = rows[0].closest('[class*="erbwhql"]') || rows[0];
+                                targetRow.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                targetRow.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                targetRow.click();
+                                
+                                for (let i = 0; i < 20; i++) {
+                                    await new Promise(r => setTimeout(r, 100));
+                                    const refreshedUsm = c0?.store?.getState()?.transient?.rootStore?.getState()?.transient?.underlyingStoreMap;
+                                    const refreshedSub = refreshedUsm?.get(foundKey);
+                                    const refreshedState = refreshedSub?.getState ? refreshedSub.getState() : refreshedSub;
+                                    const refreshedSeries = refreshedState?.options_chain?.seriesData?.[0];
+                                    if (refreshedSeries && refreshedSeries.underlying_price && refreshedSeries.underlying_price !== 25044.65) {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            const closeBtn = document.querySelector('.modaloverlay button') ||
+                                             document.querySelector('.css-1mft2lf') ||
+                                             Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === '×');
+                            if (closeBtn) closeBtn.click();
+                            await new Promise(r => setTimeout(r, 150));
+                        }
+                    } catch (e) {
+                        // Ignore UI refresh error and report current store state
+                    }
+
+                    // Re-read after refresh attempt
+                    const finalUsm = c0?.store?.getState()?.transient?.rootStore?.getState()?.transient?.underlyingStoreMap;
+                    if (finalUsm && finalUsm.get(foundKey)) {
+                        sub = finalUsm.get(foundKey);
+                        state = sub?.getState ? sub.getState() : sub;
+                        oc = state?.options_chain;
+                        firstSeries = oc?.seriesData?.[0] || firstSeries;
+                        spotPrice = firstSeries.underlying_price || spotPrice;
+                    }
+                }
 
                 const futuresBarTime = lastFutureBar ? (lastFutureBar.date ? new Date(lastFutureBar.date).toISOString() : (lastFutureBar.date_str || null)) : null;
-                const spotPrice = firstSeries.underlying_price || null;
                 const basis = (futuresPrice !== null && spotPrice !== null) ? Number((futuresPrice - spotPrice).toFixed(2)) : null;
                 const basisPct = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 100).toFixed(4)) : null;
                 const basisBps = (basis !== null && spotPrice) ? Number(((basis / spotPrice) * 10000).toFixed(2)) : null;
@@ -647,6 +750,8 @@ class GoChartingBrowserController:
                 const dteExactDays = rawDte !== undefined && rawDte !== null ? Number(rawDte.toFixed(1)) : null;
                 const dteCalendarDays = rawDte !== undefined && rawDte !== null ? Math.ceil(rawDte) : null;
 
+                const isSpotStillStale = (spotPrice === 25044.65) || (futuresPrice !== null && spotPrice !== null && Math.abs(futuresPrice - spotPrice) > 80);
+
                 return {
                     status: 'ok',
                     futures_symbol: store?.security?.ticker || 'NSE:NIFTY-I',
@@ -654,7 +759,9 @@ class GoChartingBrowserController:
                     futures_price: futuresPrice,
                     futures_bar_time: futuresBarTime,
                     spot_price: spotPrice,
+                    spot_is_live: !isSpotStillStale,
                     basis: basis,
+                    basis_is_stale: isSpotStillStale,
                     basis_pct: basisPct,
                     basis_percent: basisPct,
                     basis_bps: basisBps,
@@ -702,9 +809,24 @@ class GoChartingBrowserController:
                 from orderflow_store import get_market_session_info
                 session_info = get_market_session_info(res.get("futures_bar_time"))
                 res["market_session_state"] = session_info["market_session_state"]
-                res["is_live"] = session_info["is_live"]
+                
+                # If spot is stale (Monday close), override is_live to False and provide explicit warning
+                if res.get("spot_is_live") is False:
+                    res["is_live"] = False
+                    res["staleness_warning"] = (
+                        f"Spot index price in GoCharting ({res.get('spot_price')}) is frozen from previous session close. "
+                        f"Basis calculation ({res.get('basis'):+0.2f} pts) is inaccurate until options chain refreshes live."
+                    )
+                    res["spot_staleness_warning"] = (
+                        f"Spot price {res.get('spot_price')} is from prior session close (Monday). "
+                        f"Real-time spot should be near ~{res.get('futures_price', 0):.1f}."
+                    )
+                else:
+                    res["is_live"] = session_info["is_live"]
+                    res["staleness_warning"] = session_info["staleness_warning"]
+                    res["spot_staleness_warning"] = None
+
                 res["data_age_seconds"] = session_info["data_age_seconds"]
-                res["staleness_warning"] = session_info["staleness_warning"]
                 return res
             elif isinstance(res, dict) and res.get("error"):
                 last_err = res.get("error")
